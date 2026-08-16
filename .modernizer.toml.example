@@ -17,3 +17,15 @@ workers = 1
 
 [github]
 # repo = "owner/repo"
+
+[autonomy]
+# Gates automatic PR creation (--pr) on a language's PROVEN track record
+# in THIS project, tracked in .modernizer_history.json across every past
+# run. A language with no history — or a poor one — cannot auto-open a
+# PR no matter how clean the current run looks; it must first accumulate
+# enough successful chunks the manual-review way. Lower these to build
+# trust faster (or effectively disable the gate with min_track_record_chunks
+# = 0), raise them to require a stronger track record before ever trusting
+# --pr unattended.
+# min_track_record_chunks = 5
+# min_success_rate = 0.8

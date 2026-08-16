@@ -30,6 +30,14 @@ _QUERY_SRC = """
   (variable_declarator
     value: (arrow_function))) @function
 """
+
+# Covers both function-declaration form and const/let-assigned arrow form
+# — a chunk can be either, so name extraction needs to recognize both.
+_NAME_QUERY_SRC = """
+(function_declaration name: (identifier) @fname)
+(variable_declarator name: (identifier) @fname value: (arrow_function))
+"""
+_CALL_QUERY_SRC = "(call_expression function: (identifier) @fname) @call"
 # The arrow-function pattern matters both for chunking legacy files (some
 # already use `const f = () => ...`) and, critically, for the structural
 # output validator: modernizing a function_declaration into an arrow
@@ -74,6 +82,8 @@ class JavaScriptHandler(LanguageHandler):
     extensions = (".js",)
     sandbox_filename = "main.js"
     supports_function_probe = True
+    name_query_src = _NAME_QUERY_SRC
+    call_query_src = _CALL_QUERY_SRC
     ts_language = Language(tsjs.language())
     query_src = _QUERY_SRC
 
@@ -97,6 +107,8 @@ class TypeScriptHandler(LanguageHandler):
     extensions = (".ts",)
     sandbox_filename = "main.ts"
     supports_function_probe = True
+    name_query_src = _NAME_QUERY_SRC
+    call_query_src = _CALL_QUERY_SRC
     ts_language = Language(tsts.language_typescript())
     query_src = _QUERY_SRC
 

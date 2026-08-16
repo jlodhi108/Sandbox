@@ -1,9 +1,15 @@
 from langgraph.graph import StateGraph, END
 
 from agents.state import AgentState
-from agents.nodes import refactorer_node, verifier_node, fallback_node, assess_risk, generate_probe
+from agents.nodes import (
+    refactorer_node, verifier_node, fallback_node, assess_risk,
+    generate_probes, wrap_call_as_probe,
+)
 from languages import get_handler_by_name
 from sandbox.verifier import verify
+
+MAX_PROBES_PER_CHUNK = 3
+MAX_REAL_CALL_SITE_PROBES = 2
 
 
 def router(state: AgentState) -> str:
@@ -52,38 +58,81 @@ def _capture_baseline_stdout(language: str, full_source: bytes) -> str | None:
     return baseline["stdout"] if baseline["status"] == "success" else None
 
 
-def _capture_function_probe(
-    language: str, full_source: bytes, original_code: str
-) -> tuple[str | None, str | None]:
-    """Generate a probe for this chunk's function and run it once against
-    the ORIGINAL (pre-modernization) file to get baseline output. Closes
-    the gap the whole-file baseline check has: that check only covers
-    whatever the file's own entry point exercises, so a function nothing
-    calls yet gets zero protection from it. Only attempted for languages
+def _find_real_call_site_probes(
+    handler, full_source: bytes, original_code: str, sibling_sources: list[bytes]
+) -> list[str]:
+    """Real calls to this function, found via Tree-sitter across the
+    current file and (in repo mode) every sibling file — strictly
+    stronger probe input than an LLM guess: it proves the function still
+    works for how it's REALLY called, not how a model imagines it might
+    be called. Capped and de-duplicated; a bare call expression here
+    still needs wrapping in a print/echo before it's a runnable probe,
+    done by the caller."""
+    function_name = handler.extract_function_name(original_code)
+    if not function_name:
+        return []
+
+    sites: list[str] = []
+    seen = set()
+    for source in [full_source] + sibling_sources:
+        for site in handler.find_call_sites(function_name, source):
+            if site not in seen:
+                seen.add(site)
+                sites.append(site)
+            if len(sites) >= MAX_REAL_CALL_SITE_PROBES:
+                return sites
+    return sites
+
+
+def _capture_function_probes(
+    language: str,
+    full_source: bytes,
+    original_code: str,
+    sibling_sources: list[bytes] | None = None,
+) -> list[dict]:
+    """Build a list of {snippet, baseline_stdout} probes for this chunk's
+    function: real call sites (see _find_real_call_site_probes) PLUS
+    LLM-synthesized diverse examples filling any remaining slots — a
+    real call site proves one real usage works, but says nothing about
+    edge cases (empty/zero/boundary) that usage happens not to exercise,
+    so both sources matter. Each candidate is verified against the
+    UNCHANGED original before being trusted; ones that don't run cleanly
+    (bad guess, or a real call site that referenced a local variable not
+    available at file scope where the probe gets appended) are dropped
+    rather than blocking modernization. Only attempted for languages
     where appending a probe is safe (see LanguageHandler.
-    supports_function_probe). Returns (None, None) on any failure —
-    probe generation is best-effort and must never block modernization
-    that the other checks already prove is safe."""
+    supports_function_probe)."""
     handler = get_handler_by_name(language)
     if not handler.supports_function_probe:
-        return None, None
+        return []
 
-    probe_snippet = generate_probe(language, original_code)
-    if probe_snippet is None:
-        print("    (no probe generated for this chunk — skipping probe check)")
-        return None, None
+    real_sites = _find_real_call_site_probes(handler, full_source, original_code, sibling_sources or [])
+    candidates = [wrap_call_as_probe(language, site) for site in real_sites]
 
-    probe_candidate = full_source + b"\n" + probe_snippet.encode("utf-8") + b"\n"
-    result = verify(probe_candidate.decode("utf-8"), handler.sandbox_filename, handler.run_command())
-    if result["status"] != "success":
-        # Probe doesn't even run cleanly against the UNCHANGED original —
-        # untrustworthy (bad argument choice, wrong assumptions about the
-        # function). Skip rather than block on a broken probe.
-        print(f"    (probe {probe_snippet!r} failed against the ORIGINAL function — skipping probe check)")
-        return None, None
+    remaining = max(0, MAX_PROBES_PER_CHUNK - len(candidates))
+    if remaining:
+        # De-dup against the real-site-derived candidates: the model
+        # sometimes independently synthesizes the exact same example a
+        # real call site already produced (confirmed live — it picked
+        # the same call main() already makes), which would otherwise
+        # waste a sandbox round-trip checking the same input twice.
+        synthesized = [s for s in generate_probes(language, original_code, count=remaining) if s not in candidates]
+        candidates.extend(synthesized)
 
-    print(f"    Probe generated: {probe_snippet}  ->  baseline: {result['stdout']!r}")
-    return probe_snippet, result["stdout"]
+    if not candidates:
+        print("    (no probes available for this chunk — skipping probe check)")
+        return []
+
+    probes = []
+    for snippet in candidates:
+        probe_candidate = full_source + b"\n" + snippet.encode("utf-8") + b"\n"
+        result = verify(probe_candidate.decode("utf-8"), handler.sandbox_filename, handler.run_command())
+        if result["status"] != "success":
+            print(f"    (probe {snippet!r} failed against the ORIGINAL function — dropping)")
+            continue
+        print(f"    Probe: {snippet}  ->  baseline: {result['stdout']!r}")
+        probes.append({"snippet": snippet, "baseline_stdout": result["stdout"]})
+    return probes
 
 
 def modernize(
@@ -92,11 +141,12 @@ def modernize(
     chunk_start: int,
     chunk_end: int,
     max_iterations: int = 5,
+    sibling_sources: list[bytes] | None = None,
 ) -> AgentState:
     app = build_graph()
     original_code = full_source[chunk_start:chunk_end].decode("utf-8")
     baseline_stdout = _capture_baseline_stdout(language, full_source)
-    probe_snippet, probe_baseline_stdout = _capture_function_probe(language, full_source, original_code)
+    probes = _capture_function_probes(language, full_source, original_code, sibling_sources)
     initial_state: AgentState = {
         "language": language,
         "full_source": full_source,
@@ -106,8 +156,7 @@ def modernize(
         "modernized_code": "",
         "required_imports": [],
         "baseline_stdout": baseline_stdout,
-        "probe_snippet": probe_snippet,
-        "probe_baseline_stdout": probe_baseline_stdout,
+        "probes": probes,
         "used_escalation": False,
         "risk_flag": False,
         "risk_reason": "",

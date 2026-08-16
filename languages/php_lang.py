@@ -15,6 +15,11 @@ class PhpHandler(LanguageHandler):
     extensions = (".php",)
     sandbox_filename = "main.php"
     supports_function_probe = True
+    name_query_src = """
+    (function_definition name: (name) @fname)
+    (method_declaration name: (name) @fname)
+    """
+    call_query_src = "(function_call_expression function: (name) @fname) @call"
     ts_language = Language(tsphp.language_php())
     query_src = """
     (function_definition) @function

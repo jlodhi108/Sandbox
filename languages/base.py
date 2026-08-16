@@ -43,6 +43,67 @@ class LanguageHandler(ABC):
     # under time pressure.
     supports_function_probe: bool = False
 
+    # Tree-sitter queries for real call-site discovery (used to build
+    # probes from actual usage instead of an LLM-guessed example). Empty
+    # string means "not supported for this language" — extract_function_name
+    # / find_call_sites become no-ops rather than raising, so languages
+    # that don't implement this degrade gracefully to LLM-only probes.
+    name_query_src: str = ""
+    call_query_src: str = ""
+
+    def extract_function_name(self, code: str) -> str | None:
+        """Pull the name out of a single-function chunk (e.g. "greet" from
+        "def greet(name): ..."). Used to search for real call sites of
+        this exact function elsewhere in the codebase."""
+        if not self.name_query_src:
+            return None
+        prefix_bytes = self.parse_wrapper_prefix.encode("utf-8")
+        wrapped = prefix_bytes + code.encode("utf-8")
+        parser = Parser(self.ts_language)
+        tree = parser.parse(wrapped)
+        query = Query(self.ts_language, self.name_query_src)
+        captures = QueryCursor(query).captures(tree.root_node)
+        for nodes in captures.values():
+            if nodes:
+                return wrapped[nodes[0].start_byte:nodes[0].end_byte].decode("utf-8")
+        return None
+
+    def find_call_sites(self, function_name: str, source: bytes) -> list[str]:
+        """Find real calls to `function_name` (free-function calls only —
+        method calls like obj.method() are excluded, since constructing a
+        valid `obj` is a much harder problem than reusing arguments from
+        an existing call). Returns the call expression text as it appears
+        in the source, e.g. 'greet("Alice")'. These are strictly stronger
+        probe inputs than an LLM-guessed example: they prove the function
+        still works for how it's REALLY used, not how a model imagines
+        it's used."""
+        if not self.call_query_src:
+            return []
+        parser = Parser(self.ts_language)
+        tree = parser.parse(source)
+        query = Query(self.ts_language, self.call_query_src)
+
+        # matches() (not captures()) — captures() flattens every match's
+        # nodes into one dict per capture NAME, losing which @fname
+        # belongs to which @call. That breaks on nested calls like
+        # print(greet('Bob')): the OUTER call's byte range contains the
+        # INNER call's @fname too, so a range-overlap check (the earlier,
+        # buggy version of this method) would wrongly match "greet" as
+        # print's own function name. matches() keeps each occurrence's
+        # captures grouped together, so @call and @fname pair correctly
+        # even when calls nest.
+        sites = []
+        for _pattern_index, match_captures in QueryCursor(query).matches(tree.root_node):
+            call_nodes = match_captures.get("call", [])
+            fname_nodes = match_captures.get("fname", [])
+            if not call_nodes or not fname_nodes:
+                continue
+            fname_text = source[fname_nodes[0].start_byte:fname_nodes[0].end_byte].decode("utf-8")
+            if fname_text == function_name:
+                call_node = call_nodes[0]
+                sites.append(source[call_node.start_byte:call_node.end_byte].decode("utf-8"))
+        return sites
+
     def chunk(self, source: bytes) -> list[CodeChunk]:
         parser = Parser(self.ts_language)
         tree = parser.parse(source)

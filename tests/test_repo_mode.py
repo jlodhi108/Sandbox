@@ -123,16 +123,20 @@ def test_open_combined_pr_includes_only_passing_files():
 
         all_stats = [
             {
-                "file_path": "a.py", "output_path": passing_output,
+                "file_path": "a.py", "language": "python", "output_path": passing_output,
                 "final_check_passed": True, "chunks_succeeded": 1, "risk_flagged": [],
             },
             {
-                "file_path": "b.py", "output_path": failing_output,
+                "file_path": "b.py", "language": "python", "output_path": failing_output,
                 "final_check_passed": False, "chunks_succeeded": 1, "risk_flagged": [],
             },
         ]
 
-        with patch("main.open_multi_file_pr") as mock_pr:
+        # Track-record eligibility has its own dedicated tests
+        # (test_track_record.py) — bypass it here so this test stays
+        # focused on "only passing files get included."
+        with patch("main.open_multi_file_pr") as mock_pr, \
+             patch("main.is_eligible", return_value=(True, "eligible")):
             mock_pr.return_value = "https://github.com/fake/repo/pull/1"
             url = _open_combined_pr(root, all_stats)
 
@@ -192,12 +196,12 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
     files = ["a.py", "b.py", "c.py"]
     delays = {"a.py": 0.05, "b.py": 0.0, "c.py": 0.0}
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr):
+    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None):
         time.sleep(delays[file_path])
         return {"file_path": file_path, "chunks_succeeded": 1}
 
     with patch("main.run_file", side_effect=fake_run_file):
-        results = _run_files_concurrently(files, open_pr=False, max_iterations=5, workers=3)
+        results = _run_files_concurrently(files, open_pr=False, max_iterations=5, workers=3, file_contents={})
 
     assert [r["file_path"] for r in results] == ["a.py", "b.py", "c.py"]
 
@@ -205,14 +209,67 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
 def test_run_files_concurrently_isolates_one_file_erroring():
     files = ["good.py", "bad.py"]
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr):
+    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None):
         if file_path == "bad.py":
             raise RuntimeError("boom")
         return {"file_path": file_path, "chunks_succeeded": 1}
 
     with patch("main.run_file", side_effect=fake_run_file):
-        results = _run_files_concurrently(files, open_pr=False, max_iterations=5, workers=2)
+        results = _run_files_concurrently(files, open_pr=False, max_iterations=5, workers=2, file_contents={})
 
     assert results[0] == {"file_path": "good.py", "chunks_succeeded": 1}
     assert results[1]["file_path"] == "bad.py"
     assert "boom" in results[1]["error"]
+
+
+def test_open_combined_pr_excludes_language_without_track_record():
+    # This is the actual gate, not the bypassed version above — a
+    # language with no history at all must be excluded even though its
+    # OWN final check passed cleanly.
+    with tempfile.TemporaryDirectory() as root:
+        py_output = os.path.join(root, "a.modernized.py")
+        _touch(py_output, "def add(a, b):\n    return a + b\n")
+
+        all_stats = [
+            {
+                "file_path": "a.py", "language": "python", "output_path": py_output,
+                "final_check_passed": True, "chunks_succeeded": 1, "risk_flagged": [],
+            },
+        ]
+
+        with patch("main.open_multi_file_pr") as mock_pr, \
+             patch("main._history", {}):  # no track record for python at all
+            url = _open_combined_pr(root, all_stats)
+
+        assert url is None
+        mock_pr.assert_not_called()
+
+
+def test_open_combined_pr_includes_only_the_eligible_language():
+    with tempfile.TemporaryDirectory() as root:
+        py_output = os.path.join(root, "a.modernized.py")
+        _touch(py_output, "def add(a, b):\n    return a + b\n")
+        php_output = os.path.join(root, "b.modernized.php")
+        _touch(php_output, "<?php\nfunction add() {}\n")
+
+        all_stats = [
+            {
+                "file_path": "a.py", "language": "python", "output_path": py_output,
+                "final_check_passed": True, "chunks_succeeded": 1, "risk_flagged": [],
+            },
+            {
+                "file_path": "b.php", "language": "php", "output_path": php_output,
+                "final_check_passed": True, "chunks_succeeded": 1, "risk_flagged": [],
+            },
+        ]
+        # python has a strong proven track record; php has none yet
+        fake_history = {"python": {"chunks_succeeded": 20, "chunks_attempted": 20}}
+
+        with patch("main.open_multi_file_pr") as mock_pr, \
+             patch("main._history", fake_history):
+            mock_pr.return_value = "https://github.com/fake/repo/pull/2"
+            url = _open_combined_pr(root, all_stats)
+
+        assert url == "https://github.com/fake/repo/pull/2"
+        files_included = [f[0] for f in mock_pr.call_args[1]["files"]]
+        assert files_included == ["a.py"]  # only python, php excluded

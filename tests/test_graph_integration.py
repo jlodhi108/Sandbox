@@ -11,15 +11,15 @@ this runs in CI.
 
 Patch targets, and why: a function's global lookups always resolve
 against the module it was DEFINED in, not the module that imported it.
-refactorer_node/verifier_node/assess_risk/generate_probe are all defined
+refactorer_node/verifier_node/assess_risk/generate_probes are all defined
 in agents.nodes, so patching agents.nodes.llm / agents.nodes.verify
 covers all of them regardless of how agents.graph imported them. But
-_capture_baseline_stdout, _capture_function_probe, and the assess_risk/
-generate_probe CALL SITES inside modernize() are defined in agents.graph,
+_capture_baseline_stdout, _capture_function_probes, and the assess_risk/
+generate_probes CALL SITES inside modernize() are defined in agents.graph,
 which did `from sandbox.verifier import verify` and `from agents.nodes
-import ... assess_risk, generate_probe` — those bind local names in
+import ... assess_risk, generate_probes` — those bind local names in
 agents.graph's own namespace, so THOSE call sites need agents.graph.verify
-/ agents.graph.assess_risk / agents.graph.generate_probe patched
+/ agents.graph.assess_risk / agents.graph.generate_probes patched
 separately.
 """
 from unittest.mock import patch
@@ -182,12 +182,15 @@ def test_probe_mismatch_fails_even_when_whole_file_check_passes():
         "def add(a, b):\n    return a - b",  # WRONG — subtracts instead
     ])
 
-    def fake_generate_probe(language, function_code):
-        return "print(add(2, 3))"
+    def fake_generate_probes(language, function_code, count=3):
+        return ["print(add(2, 3))"]
 
-    # Sequence inside modernize(): baseline call, probe-baseline call,
-    # then verifier_node's whole-file call + probe call (repeated per
-    # iteration since it never succeeds).
+    # Sequence inside modernize(): baseline call, probe-baseline call
+    # (no real call sites exist in this tiny source, so it falls straight
+    # to the synthesized probe), then verifier_node's whole-file call +
+    # probe call. The probe mismatches here, so verifier_node returns
+    # immediately WITHOUT reaching the determinism re-check (that only
+    # runs when a probe matches its baseline) — 4 calls total, not 5.
     fake_verify = QueuedVerify([
         _OK,                                                     # whole-file baseline
         {"status": "success", "stderr": "", "stdout": "5\n", "exit_code": 0},  # probe baseline: 2+3=5
@@ -198,7 +201,7 @@ def test_probe_mismatch_fails_even_when_whole_file_check_passes():
     with patch("agents.nodes.llm", fake_llm), \
          patch("agents.nodes.verify", fake_verify), \
          patch("agents.graph.verify", fake_verify), \
-         patch("agents.graph.generate_probe", fake_generate_probe), \
+         patch("agents.graph.generate_probes", fake_generate_probes), \
          patch("agents.nodes.escalation_llm", None):
         final_state = modernize("python", python_source, 0, len(python_source.rstrip(b"\n")), max_iterations=1)
 

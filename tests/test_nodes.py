@@ -344,26 +344,34 @@ def test_assess_risk_defaults_to_not_flagged_on_unparseable_response():
         assert risk_flag is False
 
 
-def test_generate_probe_returns_snippet():
-    from agents.nodes import generate_probe
+def test_generate_probes_returns_list_of_snippets():
+    from agents.nodes import generate_probes
 
     mock_response = MagicMock()
-    mock_response.content = "print(add(2, 3))"
+    mock_response.content = "print(add(2, 3))\nprint(add(0, 0))\nprint(add(-1, 1))"
     with patch("agents.nodes.llm") as mock_llm:
         mock_llm.invoke.return_value = mock_response
-        probe = generate_probe("python", "def add(a, b):\n    return a + b")
-        assert probe == "print(add(2, 3))"
+        probes = generate_probes("python", "def add(a, b):\n    return a + b", count=3)
+        assert probes == ["print(add(2, 3))", "print(add(0, 0))", "print(add(-1, 1))"]
 
 
-def test_generate_probe_returns_none_on_skip():
-    from agents.nodes import generate_probe
+def test_generate_probes_returns_empty_list_on_skip():
+    from agents.nodes import generate_probes
 
     mock_response = MagicMock()
     mock_response.content = "PROBE: SKIP"
     with patch("agents.nodes.llm") as mock_llm:
         mock_llm.invoke.return_value = mock_response
-        probe = generate_probe("python", "def connect(db_handle):\n    ...")
-        assert probe is None
+        probes = generate_probes("python", "def connect(db_handle):\n    ...")
+        assert probes == []
+
+
+def test_wrap_call_as_probe_per_language():
+    from agents.nodes import wrap_call_as_probe
+
+    assert wrap_call_as_probe("python", "greet('Alice')") == "print(greet('Alice'))"
+    assert wrap_call_as_probe("javascript", "greet('Alice')") == "console.log(greet('Alice'))"
+    assert wrap_call_as_probe("php", "greet('Alice')") == "echo greet('Alice');"
 
 
 def test_verifier_node_rejects_probe_output_mismatch():
@@ -377,15 +385,15 @@ def test_verifier_node_rejects_probe_output_mismatch():
         "modernized_code": "def add(a, b):\n    return a + b",
         "required_imports": [],
         "baseline_stdout": None,
-        "probe_snippet": "print(add(2, 3))",
-        "probe_baseline_stdout": "5\n",
+        "probes": [{"snippet": "print(add(2, 3))", "baseline_stdout": "5\n"}],
         "compiler_stderr": "",
         "iteration_count": 0,
         "status": "pending",
     }
     with patch("agents.nodes.verify") as mock_verify:
         # first call: the whole-file check (success, empty file has no output)
-        # second call: the probe check (returns WRONG result)
+        # second call: the probe check (returns WRONG result) — determinism
+        # re-check never fires since this probe already failed
         mock_verify.side_effect = [
             {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},
             {"status": "success", "stderr": "", "stdout": "99\n", "exit_code": 0},
@@ -404,16 +412,73 @@ def test_verifier_node_accepts_matching_probe_output():
         "modernized_code": "def add(a, b):\n    return a + b",
         "required_imports": [],
         "baseline_stdout": None,
-        "probe_snippet": "print(add(2, 3))",
-        "probe_baseline_stdout": "5\n",
+        "probes": [{"snippet": "print(add(2, 3))", "baseline_stdout": "5\n"}],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify:
+        # whole-file check, probe check, THEN the determinism re-check
+        # (same probe run again) — all three must be consumed
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},
+            {"status": "success", "stderr": "", "stdout": "5\n", "exit_code": 0},
+            {"status": "success", "stderr": "", "stdout": "5\n", "exit_code": 0},
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "success"
+        assert mock_verify.call_count == 3
+
+
+def test_verifier_node_checks_all_probes_not_just_the_first():
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [
+            {"snippet": "print(add(2, 3))", "baseline_stdout": "5\n"},
+            {"snippet": "print(add(0, 0))", "baseline_stdout": "0\n"},
+        ],
         "compiler_stderr": "",
         "iteration_count": 0,
         "status": "pending",
     }
     with patch("agents.nodes.verify") as mock_verify:
         mock_verify.side_effect = [
-            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},
-            {"status": "success", "stderr": "", "stdout": "5\n", "exit_code": 0},
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},   # whole-file
+            {"status": "success", "stderr": "", "stdout": "5\n", "exit_code": 0},  # probe[0]
+            {"status": "success", "stderr": "", "stdout": "5\n", "exit_code": 0},  # probe[0] determinism re-check
+            {"status": "success", "stderr": "", "stdout": "WRONG\n", "exit_code": 0},  # probe[1] — mismatch
         ]
         result = verifier_node(state)
-        assert result["status"] == "success"
+        assert result["status"] == "failed"
+        assert "print(add(0, 0))" in result["compiler_stderr"]
+
+
+def test_verifier_node_rejects_nondeterministic_output():
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [{"snippet": "print(add(2, 3))", "baseline_stdout": "5\n"}],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify:
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},   # whole-file
+            {"status": "success", "stderr": "", "stdout": "5\n", "exit_code": 0},  # probe run 1 matches baseline
+            {"status": "success", "stderr": "", "stdout": "7\n", "exit_code": 0},  # probe run 2 — DIFFERENT from run 1
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "failed"
+        assert "non-deterministic" in result["compiler_stderr"]

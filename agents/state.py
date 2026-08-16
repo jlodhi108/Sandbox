@@ -20,13 +20,12 @@ class AgentState(TypedDict):
                                   # modernization, captured once up front.
                                   # None if the original itself didn't run
                                   # cleanly (nothing to compare against).
-    probe_snippet: str | None       # "call this function, print result"
-                                     # snippet, generated once up front.
-                                     # None if unsupported for this
-                                     # language or generation failed.
-    probe_baseline_stdout: str | None  # probe's output against the
-                                        # ORIGINAL function, to compare
-                                        # the modernized version against.
+    probes: list[dict]      # [{"snippet": str, "baseline_stdout": str}, ...]
+                             # captured once up front, against the ORIGINAL
+                             # function — real call sites found in the
+                             # codebase plus LLM-synthesized diverse
+                             # examples. Empty list if unsupported for
+                             # this language or none could be verified.
     used_escalation: bool   # True once any attempt on this chunk used the
                              # stronger escalation model, not just the
                              # default — surfaced in the run report

@@ -17,6 +17,8 @@ class PythonHandler(LanguageHandler):
     extensions = (".py",)
     sandbox_filename = "main.py"
     supports_function_probe = True
+    name_query_src = "(function_definition name: (identifier) @fname)"
+    call_query_src = "(call function: (identifier) @fname) @call"
     ts_language = Language(tspy.language())
     # function_definition covers both free functions and methods (methods
     # are function_definition nodes nested inside class_definition) — we

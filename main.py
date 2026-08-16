@@ -22,6 +22,17 @@ from languages import get_handler
 from agents.graph import modernize
 from sandbox.verifier import verify
 from git_ops.pr import open_modernization_pr, open_multi_file_pr
+from track_record import load_history, save_history, record_run, is_eligible
+
+# Loaded once at startup, read against for every auto-PR eligibility
+# check this run makes — always reflects PRIOR runs only. Updated with
+# THIS run's results and persisted at the very end (see __main__), never
+# mid-run, so a run can't bootstrap its own eligibility using its own
+# in-progress results.
+_history = load_history()
+_autonomy_settings = _config.get("autonomy", {})
+_MIN_TRACK_RECORD_CHUNKS = _autonomy_settings.get("min_track_record_chunks", 5)
+_MIN_SUCCESS_RATE = _autonomy_settings.get("min_success_rate", 0.8)
 
 # Common vendor/build/VCS directories to never descend into in repo mode —
 # nothing in here is source you'd want modernized, and node_modules/.git
@@ -59,7 +70,10 @@ def _unified_diff(original: str, modernized: str, file_path: str) -> str:
     return "".join(diff_lines)
 
 
-def run_file(file_path: str, open_pr: bool, max_iterations: int, standalone_pr: bool = True) -> dict:
+def run_file(
+    file_path: str, open_pr: bool, max_iterations: int,
+    standalone_pr: bool = True, sibling_sources: list[bytes] | None = None,
+) -> dict:
     """Modernize one file. Returns a stats dict (also the data source for
     --report) rather than just printing, so repo mode can aggregate
     results across many files without re-parsing terminal output.
@@ -70,7 +84,12 @@ def run_file(file_path: str, open_pr: bool, max_iterations: int, standalone_pr: 
     PR at the end — GitHub has no atomic multi-file update via the
     single-file convenience API, so letting each file open its own PR
     would mean N separate PRs for one repo-wide run, which is exactly
-    the noisy outcome multi-file mode exists to avoid."""
+    the noisy outcome multi-file mode exists to avoid.
+
+    sibling_sources: raw bytes of every OTHER file in the repo (repo mode
+    only — empty/None for standalone single-file runs), searched for real
+    calls to each function being modernized so probes can use actual
+    usage instead of an LLM-guessed example."""
     start_time = time.time()
     handler = get_handler(file_path)
     with open(file_path, "rb") as f:
@@ -119,7 +138,7 @@ def run_file(file_path: str, open_pr: bool, max_iterations: int, standalone_pr: 
 
         final_state = modernize(
             handler.name, working_source, chunk.start_byte, chunk.end_byte,
-            max_iterations=max_iterations,
+            max_iterations=max_iterations, sibling_sources=sibling_sources,
         )
         print(f"status={final_state['status']} iterations={final_state['iteration_count']}")
 
@@ -129,7 +148,7 @@ def run_file(file_path: str, open_pr: bool, max_iterations: int, standalone_pr: 
             "status": final_state["status"],
             "iterations": final_state["iteration_count"],
             "used_escalation": final_state.get("used_escalation", False),
-            "had_probe": final_state.get("probe_snippet") is not None,
+            "probe_count": len(final_state.get("probes") or []),
             "risk_flag": final_state.get("risk_flag", False),
             "duration_seconds": time.time() - chunk_start_time,
         }
@@ -224,6 +243,17 @@ def run_file(file_path: str, open_pr: bool, max_iterations: int, standalone_pr: 
                   "Inspect the output file manually before proposing it.")
             stats["duration_seconds"] = time.time() - start_time
             return stats
+
+        eligible, reason = is_eligible(
+            handler.name, _history, _MIN_TRACK_RECORD_CHUNKS, _MIN_SUCCESS_RATE
+        )
+        if not eligible:
+            print(f"\nRefusing to open a PR: {reason}. "
+                  "Run without --pr to build up track record first, or "
+                  "lower the thresholds in .modernizer.toml's [autonomy] table.")
+            stats["duration_seconds"] = time.time() - start_time
+            return stats
+
         risk_flagged = stats["risk_flagged"]
         url = open_modernization_pr(
             file_path=file_path,
@@ -306,7 +336,23 @@ def discover_files(root_dir: str) -> list[str]:
     return sorted(found)
 
 
-def _run_files_concurrently(files: list[str], open_pr: bool, max_iterations: int, workers: int) -> list[dict]:
+def _read_all_file_contents(files: list[str]) -> dict[str, bytes]:
+    """Pre-read every discovered file ONCE, so each file's probe
+    generation can search every OTHER file for real call sites without
+    re-reading repeatedly (O(n) reads total, not O(n^2))."""
+    contents = {}
+    for fp in files:
+        try:
+            with open(fp, "rb") as f:
+                contents[fp] = f.read()
+        except OSError as e:
+            print(f"WARNING: could not read {fp} for cross-file probe context: {e}")
+    return contents
+
+
+def _run_files_concurrently(
+    files: list[str], open_pr: bool, max_iterations: int, workers: int, file_contents: dict[str, bytes],
+) -> list[dict]:
     """Run run_file() for independent files in parallel. Safe because
     files don't share state — only chunks WITHIN a single file have an
     ordering dependency (each verified against the accumulated result of
@@ -317,10 +363,11 @@ def _run_files_concurrently(files: list[str], open_pr: bool, max_iterations: int
     finish first."""
     results: list[dict | None] = [None] * len(files)
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_index = {
-            executor.submit(run_file, file_path, open_pr, max_iterations, False): i
-            for i, file_path in enumerate(files)
-        }
+        future_to_index = {}
+        for i, file_path in enumerate(files):
+            siblings = [content for fp, content in file_contents.items() if fp != file_path]
+            future = executor.submit(run_file, file_path, open_pr, max_iterations, False, siblings)
+            future_to_index[future] = i
         for future in as_completed(future_to_index):
             i = future_to_index[future]
             file_path = files[i]
@@ -336,6 +383,8 @@ def run_repo(root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1
     files = discover_files(root_dir)
     print(f"Found {len(files)} modernizable file(s) under {root_dir}")
 
+    file_contents = _read_all_file_contents(files)
+
     if workers > 1:
         print(
             f"Processing with {workers} concurrent workers. Files are "
@@ -345,15 +394,19 @@ def run_repo(root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1
             f"--report for clean structured results instead of reading "
             f"the terminal for a concurrent run."
         )
-        all_stats = _run_files_concurrently(files, open_pr, max_iterations, workers)
+        all_stats = _run_files_concurrently(files, open_pr, max_iterations, workers, file_contents)
     else:
         all_stats = []
         for i, file_path in enumerate(files, 1):
             print(f"\n{'=' * 60}\n[{i}/{len(files)}] {file_path}\n{'=' * 60}")
+            siblings = [content for fp, content in file_contents.items() if fp != file_path]
             try:
                 # standalone_pr=False: never open a per-file PR here, even
                 # if open_pr is set — repo mode opens ONE combined PR below.
-                stats = run_file(file_path, open_pr, max_iterations, standalone_pr=False)
+                stats = run_file(
+                    file_path, open_pr, max_iterations,
+                    standalone_pr=False, sibling_sources=siblings,
+                )
             except Exception as e:
                 print(f"ERROR processing {file_path}: {e}")
                 stats = {"file_path": file_path, "error": str(e)}
@@ -380,11 +433,28 @@ def run_repo(root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1
 
 
 def _open_combined_pr(root_dir: str, all_stats: list[dict]) -> str | None:
-    """Gather every file whose final behavioral check passed and open ONE
-    PR containing all of them, instead of one PR per file."""
-    eligible = [s for s in all_stats if s.get("final_check_passed") and s.get("output_path")]
-    if not eligible:
+    """Gather every file whose final behavioral check passed AND whose
+    language has a proven-enough track record, and open ONE PR containing
+    all of them, instead of one PR per file. A repo can span languages
+    with very different track records (e.g. Python well-proven, PHP
+    brand new to this tool) — each file's eligibility is checked against
+    ITS OWN language, not the repo as a whole."""
+    checked_passed = [s for s in all_stats if s.get("final_check_passed") and s.get("output_path")]
+    if not checked_passed:
         print("\nNo files passed their final check — no PR to open.")
+        return None
+
+    eligible = []
+    for s in checked_passed:
+        ok, reason = is_eligible(s["language"], _history, _MIN_TRACK_RECORD_CHUNKS, _MIN_SUCCESS_RATE)
+        if ok:
+            eligible.append(s)
+        else:
+            print(f"Excluding {s['file_path']} from PR: {reason}")
+
+    if not eligible:
+        print("\nNo files' languages have enough track record yet — no PR to open. "
+              "Run without --pr to build up track record first.")
         return None
 
     files_for_pr = []
@@ -459,6 +529,23 @@ if __name__ == "__main__":
     else:
         results = [run_file(args.path, args.pr, args.max_iterations)]
         mode = "file"
+
+    # Fold THIS run's per-language results into the persisted track
+    # record for NEXT time. Deliberately happens after every run, whether
+    # or not --pr was used — track record should reflect all attempts,
+    # not just ones that already passed the gate, otherwise a language
+    # could never accumulate the history needed to become eligible.
+    updated_history = _history
+    for s in results:
+        language = s.get("language")
+        if not language:
+            continue
+        attempted = s.get("chunks_succeeded", 0) + s.get("chunks_gave_up", 0)
+        if attempted == 0:
+            continue
+        updated_history = record_run(updated_history, language, s.get("chunks_succeeded", 0), attempted)
+    if updated_history != _history:
+        save_history(updated_history)
 
     if args.report:
         write_report(args.report, mode, results)

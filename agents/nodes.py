@@ -196,39 +196,73 @@ def verifier_node(state: AgentState) -> AgentState:
             }
 
     # Whole-file baseline only proves equivalence for whatever the file's
-    # entry point exercises. If a probe is available (this chunk's
-    # function was reachable enough to generate one for), run it against
-    # the MODERNIZED candidate and compare — this catches regressions in
-    # functions the file's own runtime path never touches at all.
-    probe_snippet = state.get("probe_snippet")
-    probe_baseline_stdout = state.get("probe_baseline_stdout")
-    if result["status"] == "success" and probe_snippet and probe_baseline_stdout is not None:
-        probe_candidate = candidate_file + b"\n" + probe_snippet.encode("utf-8") + b"\n"
-        probe_result = verify(
-            probe_candidate.decode("utf-8"),
-            filename=handler.sandbox_filename,
-            run_cmd=handler.run_command(),
-        )
-        probe_stdout_matches = (
-            probe_result["status"] == "success" and probe_result["stdout"] == probe_baseline_stdout
-        )
-        if not probe_stdout_matches:
-            return {
-                **state,
-                "compiler_stderr": (
-                    "Your rewritten function compiles and the whole file "
-                    "still runs, but calling it directly with representative "
-                    "arguments produces a different result than the original "
-                    "function did.\n\n"
-                    f"Probe used: {probe_snippet}\n\n"
-                    f"Expected: {probe_baseline_stdout!r}\n\n"
-                    f"Got: {probe_result.get('stdout', probe_result.get('stderr'))!r}\n\n"
-                    "Fix the function so it produces IDENTICAL results for "
-                    "the same inputs."
-                ),
-                "status": "failed",
-                "iteration_count": state["iteration_count"] + 1,
-            }
+    # entry point exercises. Each probe (real call site or LLM-synthesized
+    # example — see _capture_function_probes) is run against the
+    # MODERNIZED candidate and compared to its own baseline. Checking
+    # every probe, not just one, is the direct fix for "a single example
+    # proves nothing about edge cases."
+    probes = state.get("probes") or []
+    if result["status"] == "success" and probes:
+        for i, probe in enumerate(probes):
+            snippet = probe["snippet"]
+            baseline = probe["baseline_stdout"]
+            probe_candidate = candidate_file + b"\n" + snippet.encode("utf-8") + b"\n"
+            probe_result = verify(
+                probe_candidate.decode("utf-8"),
+                filename=handler.sandbox_filename,
+                run_cmd=handler.run_command(),
+            )
+            if probe_result["status"] != "success" or probe_result["stdout"] != baseline:
+                return {
+                    **state,
+                    "compiler_stderr": (
+                        "Your rewritten function compiles and the whole file "
+                        "still runs, but calling it directly with representative "
+                        "arguments produces a different result than the original "
+                        "function did.\n\n"
+                        f"Probe used: {snippet}\n\n"
+                        f"Expected: {baseline!r}\n\n"
+                        f"Got: {probe_result.get('stdout', probe_result.get('stderr'))!r}\n\n"
+                        "Fix the function so it produces IDENTICAL results for "
+                        "the same inputs."
+                    ),
+                    "status": "failed",
+                    "iteration_count": state["iteration_count"] + 1,
+                }
+
+            if i == 0:
+                # Determinism re-check: run the SAME probe against the SAME
+                # modernized candidate a SECOND time and confirm it matches
+                # ITSELF, not just the baseline. Only done once per chunk
+                # (not once per probe) to avoid multiplying sandbox calls —
+                # this catches non-determinism the modernization may have
+                # introduced (dict-ordering dependence, uninitialized
+                # state, a subtle race) that happened to match the
+                # baseline on this one run without actually being stable.
+                probe_result_2 = verify(
+                    probe_candidate.decode("utf-8"),
+                    filename=handler.sandbox_filename,
+                    run_cmd=handler.run_command(),
+                )
+                if probe_result_2["status"] != "success" or probe_result_2["stdout"] != probe_result["stdout"]:
+                    return {
+                        **state,
+                        "compiler_stderr": (
+                            "Your rewritten function produces DIFFERENT output "
+                            "across two identical runs with the same input — "
+                            "this indicates non-deterministic behavior (e.g. "
+                            "dependence on dict/set ordering, uninitialized "
+                            "state, or a race condition) that the modernization "
+                            "introduced.\n\n"
+                            f"Probe used: {snippet}\n\n"
+                            f"Run 1: {probe_result['stdout']!r}\n\n"
+                            f"Run 2: {probe_result_2.get('stdout', probe_result_2.get('stderr'))!r}\n\n"
+                            "Fix the function so it produces the SAME output "
+                            "every time for the same input."
+                        ),
+                        "status": "failed",
+                        "iteration_count": state["iteration_count"] + 1,
+                    }
 
     return {
         **state,
@@ -297,38 +331,60 @@ _PROBE_LANGUAGE_LABELS = {
 }
 
 _PROBE_SYSTEM_PROMPT_TEMPLATE = """You will be given ONE {label} function.
-Write exactly one short snippet that calls this function with realistic,
-concrete example arguments and prints/outputs the result, so its behavior
-can be observed and compared before vs. after a future change.
+Write {count} short snippets, each on its own line, that call this
+function with DIFFERENT example arguments and print/output the result —
+so its behavior can be compared across a RANGE of inputs, not just one.
+A single example proves almost nothing about edge cases; {count} varied
+ones is a real check.
 
 Rules:
+- Each line is a complete, independent call+print statement — nothing
+  else on that line.
 - Call the function using its exact name as shown.
-- Choose simple, concrete argument values (numbers, short strings) — not
-  placeholders, not randomly generated values.
+- Make the {count} lines meaningfully different: cover a typical case,
+  an edge case (empty string / zero / negative / boundary value), and
+  another distinct typical case — don't just change one digit each time.
 - Print/output the result using this language's normal mechanism: {print_call}
 - Do NOT redefine the function. Do NOT add imports or requires. Do NOT add
-  explanatory text or markdown fences.
+  explanatory text, numbering, or markdown fences.
 - If the function needs objects/types too complex to construct from
   scratch (e.g. it takes a database connection), respond with EXACTLY:
   PROBE: SKIP
 
-Respond with ONLY the call+print snippet (or PROBE: SKIP), nothing else."""
+Respond with ONLY the {count} lines (or PROBE: SKIP), nothing else."""
 
 
-def generate_probe(language: str, function_code: str) -> str | None:
-    """Ask the model to write one small 'call this function, print the
-    result' snippet. This exists to close a real gap: the whole-file
-    behavioral check only proves equivalence for whatever the file's own
-    entry point happens to exercise — a function nothing in the file
-    currently calls gets zero coverage from that check. Returns None if
-    the model can't/won't produce one; callers must treat that as "no
-    probe available," not an error — this is a best-effort addition on
-    top of checks that already provide the real safety net."""
+def generate_probes(language: str, function_code: str, count: int = 3) -> list[str]:
+    """Ask the model for MULTIPLE diverse 'call this function, print the
+    result' snippets instead of just one. A single hand-picked example
+    proves almost nothing about edge cases (empty/zero/negative/boundary
+    values) it never exercises — this directly targets that gap, in the
+    same spirit as differential-fuzzing approaches to verifying LLM code
+    refactorings (generate many inputs, compare outputs across all of
+    them, not just one). Returns [] if the model can't/won't produce
+    any; callers must treat that as "no synthesized probes available,"
+    not an error."""
     label, print_call = _PROBE_LANGUAGE_LABELS[language]
-    prompt = _PROBE_SYSTEM_PROMPT_TEMPLATE.format(label=label, print_call=print_call)
+    prompt = _PROBE_SYSTEM_PROMPT_TEMPLATE.format(label=label, print_call=print_call, count=count)
     messages = [SystemMessage(content=prompt), HumanMessage(content=function_code)]
     response = _invoke_llm_with_retry(llm, messages)
     text = _strip_markdown_fence(response.content).strip()
     if not text or "SKIP" in text.upper():
-        return None
-    return text
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[:count]
+
+
+_PROBE_WRAPPERS = {
+    "python": lambda call: f"print({call})",
+    "javascript": lambda call: f"console.log({call})",
+    "typescript": lambda call: f"console.log({call})",
+    "php": lambda call: f"echo {call};",
+}
+
+
+def wrap_call_as_probe(language: str, call_expression: str) -> str:
+    """Turn a bare call expression (e.g. from a real call site found in
+    the codebase, which is just the expression text with no print/echo
+    around it) into a runnable probe statement."""
+    return _PROBE_WRAPPERS[language](call_expression)
