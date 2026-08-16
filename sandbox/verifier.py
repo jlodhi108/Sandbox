@@ -1,5 +1,6 @@
 import docker
 import tempfile
+import shutil
 import os
 
 _client = None
@@ -26,15 +27,21 @@ def verify(
     compile/lint — and execute, so runtime failures are caught too, not
     just syntax errors)."""
     client = _get_client()
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # tempfile creates this dir mode 0700 (owner-only). The container
-        # runs as a non-root user (uid 1000) that doesn't own this
-        # host-side directory, so on native Linux Docker (GitHub Actions
-        # runners) it can't even traverse into it — permission denied on
-        # every file. macOS Docker Desktop's VM layer papers over this
-        # host/container UID mismatch, which is why it never surfaced
-        # locally. Open it up so the container can read the source and
-        # write compiler output (a.out, .class files, tsc's outDir, etc).
+
+    # Not using tempfile.TemporaryDirectory()'s context manager: its
+    # cleanup() walks the tree and chmods/unlinks everything strictly,
+    # which raises if any file is owned by a uid it doesn't own. The
+    # container writes compiler output (a.out, .class files, tsc's
+    # --outDir) as its own non-root user (uid 1000) — on native Linux
+    # Docker (unlike macOS Docker Desktop's VM layer, which papers over
+    # this) those artifacts are genuinely owned by uid 1000 on the host
+    # filesystem, and the CI runner's user can neither chmod nor delete
+    # something it doesn't own and isn't root for. ignore_errors=True
+    # leaves those specific orphaned files behind (harmless on ephemeral
+    # CI runners; worth a periodic /tmp sweep on a long-lived box) instead
+    # of crashing every verify() call that happens to produce output files.
+    tmpdir = tempfile.mkdtemp()
+    try:
         os.chmod(tmpdir, 0o777)
 
         src_path = os.path.join(tmpdir, filename)
@@ -72,6 +79,8 @@ def verify(
         finally:
             if container is not None:
                 container.remove(force=True)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
