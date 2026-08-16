@@ -16,6 +16,21 @@ def test_save_and_load_roundtrip():
         assert load_history(path) == history
 
 
+def test_save_history_leaves_no_tmp_file_behind():
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, "history.json")
+        save_history({"python": {"chunks_succeeded": 1, "chunks_attempted": 1}}, path)
+        assert os.listdir(root) == ["history.json"]
+
+
+def test_load_history_recovers_from_corrupt_file():
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, "history.json")
+        with open(path, "w") as f:
+            f.write("{not valid json")
+        assert load_history(path) == {}
+
+
 def test_record_run_creates_new_language_entry():
     history = {}
     updated = record_run(history, "python", succeeded=3, attempted=4)

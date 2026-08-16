@@ -218,6 +218,18 @@ def run_file(
 
     chunks = handler.chunk(source)
     print(f"[{handler.name}] Found {len(chunks)} chunk(s) to modernize in {file_path}")
+    if not chunks and source.strip():
+        # Zero chunks from a non-empty file is ambiguous: it's the
+        # correct, silent outcome for a file with no functions/methods at
+        # all (e.g. pure constants/config), but it's ALSO what a
+        # tree-sitter parse failure on malformed/binary-ish input looks
+        # like — same return value, no exception raised either way. A
+        # user watching the run has no way to tell those apart without
+        # this nudge to go check manually.
+        print(
+            f"    (warning: no functions/methods found — if this file isn't "
+            f"actually empty of them, tree-sitter may have failed to parse it)"
+        )
 
     stats = {
         "file_path": file_path,
@@ -637,10 +649,21 @@ def run_repo(
             all_stats.append(stats)
 
     if run_target_tests and test_framework is not None:
-        overlay_files = {
-            os.path.relpath(s["file_path"], root_dir): open(s["output_path"]).read()
-            for s in all_stats if s.get("output_path")
-        }
+        overlay_files = {}
+        for s in all_stats:
+            if not s.get("output_path"):
+                continue
+            try:
+                with open(s["output_path"]) as f:
+                    overlay_files[os.path.relpath(s["file_path"], root_dir)] = f.read()
+            except OSError as e:
+                # A file written earlier in this run being gone/unreadable
+                # by the time we get here (moved, deleted, permissions
+                # changed mid-run) shouldn't crash the whole repo summary
+                # — degrade to "not included in this test comparison"
+                # instead, same fail-soft spirit as run_test_command's
+                # own error handling.
+                print(f"    (warning: could not read {s['output_path']} for target-test overlay: {e})")
         if not overlay_files:
             print(f"\n--run-target-tests: no files were successfully modernized — nothing to re-test.")
         else:
@@ -778,7 +801,127 @@ def write_report(report_path: str, mode: str, results: list[dict]) -> None:
     print(f"\nWrote run report to {report_path}")
 
 
-if __name__ == "__main__":
+def _html_escape(text) -> str:
+    import html
+    return html.escape(str(text), quote=True)
+
+
+_STATUS_BADGE_CLASS = {
+    "success": "badge-success",
+    "already_modern": "badge-neutral",
+    "gave_up": "badge-fail",
+    "budget_exceeded": "badge-warn",
+    "failed": "badge-fail",
+}
+
+
+def write_html_report(report_path: str, mode: str, results: list[dict]) -> None:
+    """Human-readable counterpart to write_report's raw JSON — a
+    self-contained (no external assets, works offline) HTML page a
+    non-CLI reviewer can open in a browser to see, per chunk: pass/fail,
+    every flag this project's verification pipeline raised (risk,
+    security, low-confidence-mutation), iteration/escalation cost, and
+    the actual diff. The JSON report already carries all of this data;
+    this is pure presentation on top of it — no pipeline changes, so it
+    carries none of the pipeline's own risk. Written whenever
+    --report-html is passed, independent of (and in addition to)
+    --report — the two serve different audiences (tooling vs. a human
+    skimming what an autonomous run actually did before trusting a PR
+    made from it)."""
+    from datetime import datetime, timezone
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    usage = llm_budget.summary()
+
+    total_chunks = sum(s.get("chunks_total", 0) for s in results if "error" not in s)
+    total_succeeded = sum(s.get("chunks_succeeded", 0) for s in results if "error" not in s)
+    total_flagged = sum(
+        len(s.get("risk_flagged", [])) + len(s.get("security_flagged", [])) + len(s.get("low_confidence_flagged", []))
+        for s in results if "error" not in s
+    )
+
+    file_sections = []
+    for s in results:
+        if "error" in s:
+            file_sections.append(
+                f'<section class="file-card"><h2>{_html_escape(s.get("file_path", "?"))}</h2>'
+                f'<p class="badge badge-fail">ERROR</p><pre class="err">{_html_escape(s["error"])}</pre></section>'
+            )
+            continue
+
+        rows = []
+        for c in s.get("chunk_details", []):
+            badge_class = _STATUS_BADGE_CLASS.get(c.get("status"), "badge-neutral")
+            flags = []
+            if c.get("risk_flag"):
+                flags.append('<span class="badge badge-warn">risk</span>')
+            if c.get("security_flag"):
+                flags.append('<span class="badge badge-warn">security</span>')
+            if c.get("mutation_confidence_flag"):
+                flags.append('<span class="badge badge-warn">low-confidence</span>')
+            if c.get("used_escalation"):
+                flags.append('<span class="badge badge-neutral">escalated</span>')
+            diff_html = (
+                f'<details><summary>diff</summary><pre class="diff">{_html_escape(c["diff"])}</pre></details>'
+                if c.get("diff") else ""
+            )
+            rows.append(
+                "<tr>"
+                f'<td>{_html_escape(c.get("kind", ""))} @{c.get("start_byte", "?")}</td>'
+                f'<td><span class="badge {badge_class}">{_html_escape(c.get("status", ""))}</span></td>'
+                f'<td>{c.get("iterations", 0)}</td>'
+                f'<td>{" ".join(flags)}</td>'
+                f'<td>{c.get("duration_seconds", 0):.1f}s</td>'
+                f'<td>{diff_html}</td>'
+                "</tr>"
+            )
+
+        file_sections.append(
+            f'<section class="file-card"><h2>{_html_escape(s.get("file_path", "?"))} '
+            f'<span class="lang">{_html_escape(s.get("language", ""))}</span></h2>'
+            f'<p>{s.get("chunks_succeeded", 0)}/{s.get("chunks_total", 0)} chunk(s) succeeded, '
+            f'{s.get("chunks_already_modern", 0)} already modern, '
+            f'{s.get("chunks_gave_up", 0)} gave up</p>'
+            f'<table><thead><tr><th>Chunk</th><th>Status</th><th>Iters</th>'
+            f'<th>Flags</th><th>Time</th><th>Diff</th></tr></thead>'
+            f"<tbody>{''.join(rows)}</tbody></table></section>"
+        )
+
+    html_doc = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>code-modernizer run report</title>
+<style>
+body {{ font: 14px/1.5 -apple-system, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; background: #fff; }}
+h1 {{ font-size: 1.4rem; }} h2 {{ font-size: 1.1rem; }}
+.summary {{ display: flex; gap: 2rem; margin: 1rem 0 2rem; }}
+.summary div {{ background: #f5f5f5; border-radius: 8px; padding: 0.75rem 1rem; }}
+.summary .n {{ font-size: 1.5rem; font-weight: 600; display: block; }}
+.file-card {{ border: 1px solid #e0e0e0; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem; }}
+.lang {{ font-weight: 400; color: #888; font-size: 0.85rem; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+th, td {{ text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #eee; vertical-align: top; }}
+.badge {{ display: inline-block; padding: 0.1rem 0.5rem; border-radius: 10px; font-size: 0.75rem; margin-right: 0.25rem; }}
+.badge-success {{ background: #d4f4dd; color: #1a7a3a; }}
+.badge-fail {{ background: #fbdada; color: #a3282f; }}
+.badge-warn {{ background: #fff2cc; color: #97740e; }}
+.badge-neutral {{ background: #e6e6e6; color: #555; }}
+.diff, .err {{ white-space: pre-wrap; background: #f8f8f8; padding: 0.5rem; border-radius: 6px; overflow-x: auto; }}
+</style></head><body>
+<h1>code-modernizer run report</h1>
+<p>Generated {_html_escape(generated_at)} &middot; mode: {_html_escape(mode)}</p>
+<div class="summary">
+<div><span class="n">{total_succeeded}/{total_chunks}</span>chunks succeeded</div>
+<div><span class="n">{total_flagged}</span>flagged for review</div>
+<div><span class="n">{usage['total_calls']}</span>LLM calls</div>
+</div>
+{''.join(file_sections)}
+</body></html>"""
+
+    with open(report_path, "w") as f:
+        f.write(html_doc)
+    print(f"Wrote human-readable HTML report to {report_path}")
+
+
+def main():
     # CLI flag defaults come from .modernizer.toml's [settings] table when
     # present, falling back to the hardcoded values below — an explicit
     # flag on the command line always overrides both.
@@ -791,6 +934,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--report", metavar="PATH", default=_settings.get("report"),
         help="Write a structured JSON run report to this path",
+    )
+    parser.add_argument(
+        "--report-html", metavar="PATH", default=_settings.get("report_html"),
+        help="Write a self-contained, human-readable HTML run report to this path "
+             "(per-chunk status, flags, diffs) — for reviewing a run in a browser "
+             "instead of reading raw JSON. Independent of --report; pass both to get both.",
     )
     parser.add_argument(
         "--workers", type=int, default=_settings.get("workers", 1),
@@ -891,3 +1040,9 @@ if __name__ == "__main__":
 
     if args.report:
         write_report(args.report, mode, results)
+    if args.report_html:
+        write_html_report(args.report_html, mode, results)
+
+
+if __name__ == "__main__":
+    main()

@@ -11,12 +11,6 @@ max_iterations = 5
 workers = 1
 # report = "modernizer-report.json"
 #
-# Self-contained HTML counterpart to `report` above — per-chunk status,
-# flags (risk/security/low-confidence), iteration count, and diffs,
-# viewable in a browser instead of reading raw JSON. Independent of
-# `report`; set both to get both.
-# report_html = "modernizer-report.html"
-#
 # Hard ceiling on total LLM calls for ONE run (a single file, or a whole
 # repo run) — unset means unlimited. best-of-N x retry-iterations x
 # probes x chunks x files can multiply fast with nothing capping it

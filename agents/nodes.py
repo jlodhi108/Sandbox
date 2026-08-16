@@ -20,7 +20,20 @@ from llm_budget import LLMBudget
 MAX_LLM_CALLS_PER_RUN = os.environ.get("MAX_LLM_CALLS_PER_RUN")
 llm_budget = LLMBudget(max_calls=int(MAX_LLM_CALLS_PER_RUN) if MAX_LLM_CALLS_PER_RUN else None)
 
-llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0)
+# Ollama inference params, sized for qwen2.5-coder:14b rather than the
+# library's defaults (2048 ctx / unbounded predict — too small a context
+# window truncates larger chunks silently instead of erroring, which is
+# worse than being explicit here). Both env-overridable for parity with
+# every other tunable in this module.
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_NUM_PREDICT = int(os.environ.get("OLLAMA_NUM_PREDICT", "2048"))
+
+llm = ChatOllama(
+    model="qwen2.5-coder:14b",
+    temperature=0,
+    num_ctx=OLLAMA_NUM_CTX,
+    num_predict=OLLAMA_NUM_PREDICT,
+)
 
 # Optional escalation to a stronger model after the cheap one keeps
 # failing on the SAME chunk. Off by default — behavior is completely
@@ -31,7 +44,10 @@ llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0)
 # where the cheap one already showed it can't do the job.
 ESCALATION_MODEL = os.environ.get("ESCALATION_MODEL")
 ESCALATION_THRESHOLD = int(os.environ.get("ESCALATION_THRESHOLD", "3"))
-escalation_llm = ChatOllama(model=ESCALATION_MODEL, temperature=0) if ESCALATION_MODEL else None
+escalation_llm = (
+    ChatOllama(model=ESCALATION_MODEL, temperature=0, num_ctx=OLLAMA_NUM_CTX, num_predict=OLLAMA_NUM_PREDICT)
+    if ESCALATION_MODEL else None
+)
 
 # Optional dedicated model for assess_risk()'s self-critique step. Research
 # on adversarial/verifier-pattern code review is explicit that a model
@@ -42,7 +58,10 @@ escalation_llm = ChatOllama(model=ESCALATION_MODEL, temperature=0) if ESCALATION
 # escalation_llm to get a genuinely different model for free when one is
 # already configured, with zero new setup required.
 REVIEWER_MODEL = os.environ.get("REVIEWER_MODEL")
-reviewer_llm = ChatOllama(model=REVIEWER_MODEL, temperature=0) if REVIEWER_MODEL else None
+reviewer_llm = (
+    ChatOllama(model=REVIEWER_MODEL, temperature=0, num_ctx=OLLAMA_NUM_CTX, num_predict=OLLAMA_NUM_PREDICT)
+    if REVIEWER_MODEL else None
+)
 
 # Execution-grounded best-of-N: on the FIRST (blind, no error feedback)
 # attempt only, generate this many independent candidates and let
@@ -54,7 +73,12 @@ reviewer_llm = ChatOllama(model=REVIEWER_MODEL, temperature=0) if REVIEWER_MODEL
 # `llm` twice with an identical prompt would return the same response
 # both times, defeating the purpose.
 BEST_OF_N_ON_FIRST_ATTEMPT = int(os.environ.get("BEST_OF_N_ON_FIRST_ATTEMPT", "2"))
-_diversity_llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0.7)
+_diversity_llm = ChatOllama(
+    model="qwen2.5-coder:14b",
+    temperature=0.7,
+    num_ctx=OLLAMA_NUM_CTX,
+    num_predict=OLLAMA_NUM_PREDICT,
+)
 
 _LLM_RETRY_ATTEMPTS = 3
 _LLM_RETRY_DELAY_SECONDS = 3

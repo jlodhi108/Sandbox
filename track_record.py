@@ -12,13 +12,30 @@ def load_history(path: str = DEFAULT_HISTORY_PATH) -> dict:
     fail closed, not open."""
     if not os.path.isfile(path):
         return {}
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        # A corrupt file (interrupted write, disk-full, concurrent-write
+        # collision) must not crash every subsequent run's startup —
+        # fail closed the same way "no history" does (see is_eligible's
+        # docstring): treat it as empty rather than propagating.
+        print(f"    (warning: {path} is corrupt — starting with empty track record)")
+        return {}
 
 
 def save_history(history: dict, path: str = DEFAULT_HISTORY_PATH) -> None:
-    with open(path, "w") as f:
+    # Write-then-rename instead of writing the target path directly: a
+    # crash/kill mid-write (or, in repo mode with --workers > 1, the
+    # write racing another process's write to the SAME shared history
+    # file) would otherwise leave a half-written, unparseable JSON file
+    # that load_history has to recover from on every future run.
+    # os.replace is atomic on POSIX and Windows, so readers only ever
+    # see either the old complete file or the new complete one.
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
         json.dump(history, f, indent=2)
+    os.replace(tmp_path, path)
 
 
 def record_run(history: dict, language: str, succeeded: int, attempted: int) -> dict:

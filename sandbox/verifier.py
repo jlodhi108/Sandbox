@@ -3,8 +3,35 @@ import json
 import tempfile
 import shutil
 import os
+import time
+import requests.exceptions
 
 _client = None
+
+# Transient Docker-daemon hiccups (a momentary API disconnect, the daemon
+# briefly restarting) are the same class of flakiness
+# agents/nodes.py:_invoke_llm_with_retry already retries for Ollama —
+# without this, one blip hard-fails a chunk's verification outright and
+# wastes an otherwise-good LLM candidate. Deliberately small: this is a
+# local daemon on the same machine, not a network service, so a real
+# outage should surface quickly rather than being masked by long retries.
+_DOCKER_RETRY_ATTEMPTS = 3
+_DOCKER_RETRY_DELAY_SECONDS = 2
+
+
+def _run_container_with_retry(client, **run_kwargs):
+    last_error = None
+    for attempt in range(_DOCKER_RETRY_ATTEMPTS):
+        try:
+            return client.containers.run(**run_kwargs)
+        except (docker.errors.APIError, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            if attempt < _DOCKER_RETRY_ATTEMPTS - 1:
+                time.sleep(_DOCKER_RETRY_DELAY_SECONDS)
+    raise ConnectionError(
+        f"Could not start sandbox container after {_DOCKER_RETRY_ATTEMPTS} attempts — "
+        f"is the Docker daemon running? Original error: {last_error}"
+    ) from last_error
 
 # Optional stronger container isolation (e.g. gVisor's "runsc") for the
 # containers that actually EXECUTE untrusted code. Off by default — a
@@ -121,7 +148,7 @@ def verify(
             security_opt = _security_opt()
             if security_opt:
                 run_kwargs["security_opt"] = security_opt
-            container = client.containers.run(**run_kwargs)
+            container = _run_container_with_retry(client, **run_kwargs)
 
             try:
                 result = container.wait(timeout=timeout)
@@ -135,9 +162,21 @@ def verify(
                 combined_logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
                 stdout_only = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
                 exit_code = result["StatusCode"]
-            except Exception:
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError):
+                # container.wait's OWN timeout param raises exactly this —
+                # the container is still running past `timeout` seconds,
+                # a real hang (e.g. an infinite loop in the candidate
+                # code), not a Docker problem.
                 container.kill()
                 return {"status": "failed", "stderr": "Execution timed out", "stdout": "", "exit_code": -1}
+            except docker.errors.APIError as e:
+                # A genuine daemon-side error (API disconnect, container
+                # OOM-killed, daemon restart mid-run) — mislabeling this
+                # as "Execution timed out" is misleading in reports AND
+                # to the fix-retry loop, which would otherwise retry a
+                # compile that never actually ran.
+                container.kill()
+                return {"status": "failed", "stderr": f"Docker error: {e}", "stdout": "", "exit_code": -1}
 
             return {
                 "status": "success" if exit_code == 0 else "failed",
@@ -196,7 +235,7 @@ def run_semgrep(source_code: str, filename: str, timeout: int = 15, image: str =
             security_opt = _security_opt()
             if security_opt:
                 run_kwargs["security_opt"] = security_opt
-            container = client.containers.run(**run_kwargs)
+            container = _run_container_with_retry(client, **run_kwargs)
             try:
                 container.wait(timeout=timeout)
                 stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")

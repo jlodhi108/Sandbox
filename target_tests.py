@@ -129,10 +129,25 @@ def run_target_tests_on_copy(root_dir: str, overlay_files: dict[str, str], timeo
     tmp_parent = tempfile.mkdtemp()
     try:
         tmp_copy = os.path.join(tmp_parent, "repo")
+        # node_modules/.venv/venv are excluded from the copy itself (they
+        # can be huge and copying them is slow), but the test command
+        # still needs them to be ABLE to run — without this, `npm test`
+        # or a venv-relative pytest invocation fails on missing deps in
+        # the copy every time, which looks exactly like a modernization
+        # regression (before: passes on the real repo; after: "error" on
+        # the copy) and would wrongly block --pr. Symlinking them in is
+        # safe: nothing under overlay_files ever targets these dirs (they
+        # aren't source files this project modernizes), and the copy
+        # itself is a throwaway temp dir deleted in `finally` below.
+        install_dirs = ("node_modules", ".venv", "venv")
         shutil.copytree(
             root_dir, tmp_copy,
-            ignore=shutil.ignore_patterns(".git", "node_modules", "__pycache__", ".venv", "venv"),
+            ignore=shutil.ignore_patterns(".git", "__pycache__", *install_dirs),
         )
+        for install_dir in install_dirs:
+            src = os.path.join(root_dir, install_dir)
+            if os.path.isdir(src):
+                os.symlink(src, os.path.join(tmp_copy, install_dir))
         for rel_path, content in overlay_files.items():
             dest = os.path.join(tmp_copy, rel_path)
             os.makedirs(os.path.dirname(dest), exist_ok=True)

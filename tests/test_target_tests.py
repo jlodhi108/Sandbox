@@ -139,3 +139,35 @@ def test_run_target_tests_on_copy_passes_when_overlay_keeps_tests_green():
 
         assert result is not None
         assert result["status"] == "success", result["stderr"]
+
+
+def test_run_target_tests_on_copy_symlinks_node_modules_instead_of_excluding_it():
+    # node_modules must be reachable in the copy or `npm test` fails on
+    # missing deps regardless of whether the modernization is correct —
+    # that false "regression" would wrongly block --pr. Prove the
+    # installed-dependency dir survives into the copy as a symlink back
+    # to the original (not copied wholesale, not silently dropped).
+    with tempfile.TemporaryDirectory() as root:
+        _write(root, "package.json", json.dumps({"scripts": {"test": "true"}}))
+        node_modules = os.path.join(root, "node_modules")
+        os.makedirs(node_modules)
+        _write(root, "node_modules/some-dep/index.js", "module.exports = {};\n")
+
+        captured = {}
+        real_run = run_test_command
+
+        def _spy(tmp_copy, command, timeout=120):
+            # Must assert HERE, not after run_target_tests_on_copy
+            # returns — it deletes the temp copy in its `finally` block,
+            # so the path won't exist anymore by then.
+            node_modules_path = os.path.join(tmp_copy, "node_modules")
+            captured["is_link"] = os.path.islink(node_modules_path)
+            captured["realpath"] = os.path.realpath(node_modules_path)
+            return real_run(tmp_copy, command, timeout=timeout)
+
+        with patch("target_tests.run_test_command", side_effect=_spy):
+            result = run_target_tests_on_copy(root, {})
+
+        assert result is not None
+        assert captured["is_link"] is True
+        assert captured["realpath"] == os.path.realpath(node_modules)
