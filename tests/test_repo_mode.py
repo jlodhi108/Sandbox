@@ -4,13 +4,134 @@ import tempfile
 import time
 from unittest.mock import patch
 
-from main import discover_files, write_report, _open_combined_pr, _unified_diff, _run_files_concurrently
+from main import (
+    discover_files, write_report, _open_combined_pr, _unified_diff, _run_files_concurrently,
+    _isolate_probe_baselines,
+)
+from languages.python_lang import PythonHandler
 
 
 def _touch(path: str, content: str = "x = 1\n") -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
+
+
+def test_isolate_probe_baselines_replaces_whole_file_contaminated_baseline():
+    # Real bug caught live: _verify_candidate's recorded baseline_stdout
+    # for a probe is "whole file (including its own top-level prints) +
+    # probe appended", NOT the probe's own isolated output — confirmed by
+    # a real run producing baseline_stdout='5\n5\n' for a probe that only
+    # prints once. A durable regression test must isolate the function,
+    # so this re-derives a clean baseline via one extra verify() call per
+    # probe rather than trusting the recorded (contaminated) one.
+    chunk_results = [{
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "probes": [{"snippet": "print(add(2, 3))", "baseline_stdout": "5\n5\n"}],  # contaminated
+    }]
+    with patch("main.verify") as mock_verify:
+        mock_verify.return_value = {"status": "success", "stdout": "5\n", "stderr": "", "exit_code": 0}
+        isolated = _isolate_probe_baselines(PythonHandler(), chunk_results)
+
+    assert isolated[0]["probes"][0]["baseline_stdout"] == "5\n"  # the CLEAN isolated value, not "5\n5\n"
+    # Confirms it ran ONLY the function + probe, not the whole original file.
+    candidate_arg = mock_verify.call_args[0][0]
+    assert candidate_arg == "def add(a, b):\n    return a + b\nprint(add(2, 3))\n"
+
+
+def test_isolate_probe_baselines_drops_probes_that_fail_in_isolation():
+    # A probe that fails when re-run in isolation produces no usable
+    # baseline for a regression test — dropped rather than embedding a
+    # broken/empty expectation.
+    chunk_results = [{
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "probes": [{"snippet": "print(add(2, 3))", "baseline_stdout": "5\n"}],
+    }]
+    with patch("main.verify") as mock_verify:
+        mock_verify.return_value = {"status": "failed", "stdout": "", "stderr": "boom", "exit_code": 1}
+        isolated = _isolate_probe_baselines(PythonHandler(), chunk_results)
+
+    assert isolated[0]["probes"] == []
+
+
+def test_isolate_probe_baselines_is_a_noop_for_chunks_with_no_probes():
+    chunk_results = [{"modernized_code": "int add(int a, int b) { return a + b; }", "probes": []}]
+    with patch("main.verify") as mock_verify:
+        isolated = _isolate_probe_baselines(PythonHandler(), chunk_results)
+
+    assert isolated[0]["probes"] == []
+    mock_verify.assert_not_called()
+
+
+def test_resolve_interactive_review_approves_and_promotes_to_success():
+    import main
+
+    final_state = {
+        "status": "awaiting_review",
+        "review_thread_id": "fake-thread-id",
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "risk_flag": True,
+        "risk_reason": "touches global state",
+        "security_flag": False,
+        "security_findings": [],
+        "mutation_confidence_flag": False,
+        "mutation_confidence_reason": "",
+        "compiler_stderr": "",
+    }
+    with patch("main.resume_review", return_value={"status": "approved"}) as mock_resume, \
+         patch("builtins.input", return_value="y"):
+        resolved = main._resolve_interactive_review(final_state)
+
+    assert resolved["status"] == "success"
+    mock_resume.assert_called_once_with("fake-thread-id", approved=True)
+
+
+def test_resolve_interactive_review_rejects_and_demotes_to_gave_up():
+    import main
+
+    final_state = {
+        "status": "awaiting_review",
+        "review_thread_id": "fake-thread-id",
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "risk_flag": True,
+        "risk_reason": "touches global state",
+        "security_flag": False,
+        "security_findings": [],
+        "mutation_confidence_flag": False,
+        "mutation_confidence_reason": "",
+        "compiler_stderr": "",
+    }
+    with patch("main.resume_review", return_value={"status": "rejected"}) as mock_resume, \
+         patch("builtins.input", return_value="n"):
+        resolved = main._resolve_interactive_review(final_state)
+
+    assert resolved["status"] == "gave_up"
+    assert "Rejected during interactive review" in resolved["compiler_stderr"]
+    mock_resume.assert_called_once_with("fake-thread-id", approved=False)
+
+
+def test_resolve_interactive_review_treats_anything_but_y_as_rejection():
+    import main
+
+    final_state = {
+        "status": "awaiting_review", "review_thread_id": "fake-thread-id",
+        "modernized_code": "x", "risk_flag": True, "risk_reason": "x",
+        "security_flag": False, "security_findings": [],
+        "mutation_confidence_flag": False, "mutation_confidence_reason": "",
+        "compiler_stderr": "",
+    }
+    with patch("main.resume_review", return_value={"status": "rejected"}), \
+         patch("builtins.input", return_value=""):  # bare Enter, no answer
+        resolved = main._resolve_interactive_review(final_state)
+
+    assert resolved["status"] == "gave_up"
+
+
+def test_run_repo_refuses_interactive_with_concurrent_workers():
+    import main
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="workers"):
+        main.run_repo("/fake/root", open_pr=False, max_iterations=5, workers=2, interactive=True)
 
 
 def test_discover_files_finds_supported_extensions():
@@ -158,6 +279,63 @@ def test_open_combined_pr_returns_none_when_nothing_passed():
     mock_pr.assert_not_called()
 
 
+def test_open_combined_pr_refuses_on_target_test_regression():
+    # --run-target-tests found the target repo's OWN pre-existing test
+    # suite passed before modernization and doesn't after — an
+    # independent, human-authored oracle catching a real regression
+    # must refuse the PR outright, same as final_check_passed=False,
+    # even if every individual file's OWN checks looked clean.
+    import main
+    with tempfile.TemporaryDirectory() as root:
+        output = os.path.join(root, "a.modernized.py")
+        _touch(output, "def add(a, b):\n    return a + b\n")
+        all_stats = [{
+            "file_path": "a.py", "language": "python", "output_path": output,
+            "final_check_passed": True, "chunks_succeeded": 1, "risk_flagged": [],
+        }]
+
+        backup = main._last_target_test_result
+        try:
+            main._last_target_test_result = {
+                "framework": "pytest", "baseline": {"status": "success"},
+                "after": {"status": "failed"}, "regressed": True,
+            }
+            with patch("main.open_multi_file_pr") as mock_pr, \
+                 patch("main.is_eligible", return_value=(True, "eligible")):
+                url = _open_combined_pr(root, all_stats)
+        finally:
+            main._last_target_test_result = backup
+
+    assert url is None
+    mock_pr.assert_not_called()
+
+
+def test_open_combined_pr_proceeds_when_no_regression_detected():
+    import main
+    with tempfile.TemporaryDirectory() as root:
+        output = os.path.join(root, "a.modernized.py")
+        _touch(output, "def add(a, b):\n    return a + b\n")
+        all_stats = [{
+            "file_path": "a.py", "language": "python", "output_path": output,
+            "final_check_passed": True, "chunks_succeeded": 1, "risk_flagged": [],
+        }]
+
+        backup = main._last_target_test_result
+        try:
+            main._last_target_test_result = {
+                "framework": "pytest", "baseline": {"status": "success"},
+                "after": {"status": "success"}, "regressed": False,
+            }
+            with patch("main.open_multi_file_pr") as mock_pr, \
+                 patch("main.is_eligible", return_value=(True, "eligible")):
+                mock_pr.return_value = "https://github.com/fake/repo/pull/2"
+                url = _open_combined_pr(root, all_stats)
+        finally:
+            main._last_target_test_result = backup
+
+    assert url == "https://github.com/fake/repo/pull/2"
+
+
 def test_unified_diff_shows_the_actual_change():
     original = "def add(a, b):\n    return a + b\n"
     modernized = "def add(a: int, b: int) -> int:\n    return a + b\n"
@@ -196,7 +374,7 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
     files = ["a.py", "b.py", "c.py"]
     delays = {"a.py": 0.05, "b.py": 0.0, "c.py": 0.0}
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None):
+    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False):
         time.sleep(delays[file_path])
         return {"file_path": file_path, "chunks_succeeded": 1}
 
@@ -209,7 +387,7 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
 def test_run_files_concurrently_isolates_one_file_erroring():
     files = ["good.py", "bad.py"]
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None):
+    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False):
         if file_path == "bad.py":
             raise RuntimeError("boom")
         return {"file_path": file_path, "chunks_succeeded": 1}

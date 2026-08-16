@@ -3,8 +3,9 @@ from langgraph.graph import StateGraph, END
 from agents.state import AgentState
 from agents.nodes import (
     refactorer_node, verifier_node, fallback_node, assess_risk, scan_security,
-    generate_probes, wrap_call_as_probe,
+    generate_probes, wrap_call_as_probe, check_mutation_confidence,
 )
+from agents.review_graph import start_review
 from languages import get_handler_by_name
 from sandbox.verifier import verify
 
@@ -142,6 +143,7 @@ def modernize(
     chunk_end: int,
     max_iterations: int = 5,
     sibling_sources: list[bytes] | None = None,
+    interactive: bool = False,
 ) -> AgentState:
     app = build_graph()
     original_code = full_source[chunk_start:chunk_end].decode("utf-8")
@@ -163,6 +165,9 @@ def modernize(
         "risk_reason": "",
         "security_flag": False,
         "security_findings": [],
+        "mutation_confidence_flag": False,
+        "mutation_confidence_reason": "",
+        "review_thread_id": None,
         "compiler_stderr": "",
         "iteration_count": 0,
         "status": "pending",
@@ -170,19 +175,50 @@ def modernize(
     }
     final_state = app.invoke(initial_state)
 
-    # Risk assessment and security scan both run once, after the graph is
-    # done, only for chunks that actually succeeded — no point spending
-    # extra cycles critiquing a change that already got rejected.
+    # Risk assessment, security scan, and mutation-confidence check all
+    # run once, after the graph is done, only for chunks that actually
+    # succeeded — no point spending extra cycles critiquing a change
+    # that already got rejected.
     if final_state["status"] == "success":
-        risk_flag, risk_reason = assess_risk(final_state["modernized_code"])
+        risk_flag, risk_reason = assess_risk(final_state["modernized_code"], final_state["used_escalation"])
         security_flag, security_findings = scan_security(language, final_state["modernized_code"])
+        handler = get_handler_by_name(language)
+        mutation_confidence_flag, mutation_confidence_reason = check_mutation_confidence(
+            handler, final_state, final_state["modernized_code"], final_state["required_imports"]
+        )
         final_state = {
             **final_state,
             "risk_flag": risk_flag,
             "risk_reason": risk_reason,
             "security_flag": security_flag,
             "security_findings": security_findings,
+            "mutation_confidence_flag": mutation_confidence_flag,
+            "mutation_confidence_reason": mutation_confidence_reason,
         }
+
+        # interactive=False (default): completely unchanged from before
+        # this feature existed — flags are surfaced, nothing pauses.
+        # interactive=True: hand the (already-computed) flags to the
+        # SEPARATE review graph (agents/review_graph.py) rather than
+        # blocking here — a flagged chunk comes back with status
+        # "awaiting_review" and a review_thread_id instead of "success",
+        # for the caller (main.py's --interactive prompt, or
+        # mcp_server.py's resume_chunk_review tool) to resolve.
+        if interactive:
+            review = start_review({
+                "risk_flag": risk_flag,
+                "risk_reason": risk_reason,
+                "security_flag": security_flag,
+                "security_findings": security_findings,
+                "mutation_confidence_flag": mutation_confidence_flag,
+                "mutation_confidence_reason": mutation_confidence_reason,
+            })
+            if review["status"] == "awaiting_review":
+                final_state = {
+                    **final_state,
+                    "status": "awaiting_review",
+                    "review_thread_id": review["thread_id"],
+                }
 
     return final_state
 

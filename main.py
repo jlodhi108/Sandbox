@@ -21,9 +21,14 @@ apply_config_to_environment(_config)
 
 from languages import get_handler
 from agents.graph import modernize
+from agents.review_graph import resume_review
+from agents.nodes import llm_budget
 from sandbox.verifier import verify
 from git_ops.pr import open_modernization_pr, open_multi_file_pr
 from track_record import load_history, save_history, record_run, is_eligible
+from llm_budget import BudgetExceededError
+from target_tests import detect_test_command, run_test_command, run_target_tests_on_copy
+from regression_tests import generate_regression_test_file, regression_test_filename
 
 # Loaded once at startup, read against for every auto-PR eligibility
 # check this run makes — always reflects PRIOR runs only. Updated with
@@ -42,6 +47,14 @@ _EXCLUDED_DIRS = {
     ".git", "node_modules", "venv", ".venv", "__pycache__",
     "dist", "build", "out", ".next", "target", ".pytest_cache",
 }
+
+# Set by run_repo() when --run-target-tests is used, read by write_report
+# and the __main__ summary print. A module-level slot rather than a
+# return value: run_repo's return type (list[dict], one per file) is
+# already relied on by callers, and this is a single REPO-LEVEL result,
+# not a per-file one — same reasoning as llm_budget being a
+# module-level object rather than threaded through every call.
+_last_target_test_result: dict | None = None
 
 
 def _unified_diff(original: str, modernized: str, file_path: str) -> str:
@@ -71,14 +84,20 @@ def _unified_diff(original: str, modernized: str, file_path: str) -> str:
     return "".join(diff_lines)
 
 
-def _format_flags_section(risk_flagged: list[dict], security_flagged: list[dict]) -> str:
+def _format_flags_section(
+    risk_flagged: list[dict], security_flagged: list[dict], low_confidence_flagged: list[dict] | None = None,
+) -> str:
     """Shared by the single-file PR body and (via the same shape) the
-    combined repo-mode PR body — two independent flag types, surfaced
+    combined repo-mode PR body — independent flag types, surfaced
     separately since they catch different things: risk_flag is "this
     touches something a stdout-diff can't fully verify" (LLM
     self-critique), security_flag is "static analysis found a specific
-    pattern" (semgrep). A chunk can be flagged by either, both, or
-    neither."""
+    pattern" (semgrep), low_confidence (mutation check) is "this chunk's
+    OWN verification didn't distinguish a deliberately-broken variant
+    from the accepted one" — a signal about the check's strength, not a
+    property of the code itself. A chunk can be flagged by any
+    combination of the three, or none."""
+    low_confidence_flagged = low_confidence_flagged or []
     parts = []
     if risk_flagged:
         parts.append(
@@ -103,12 +122,78 @@ def _format_flags_section(risk_flagged: list[dict], security_flagged: list[dict]
     else:
         parts.append("No security findings.")
 
+    if low_confidence_flagged:
+        parts.append(
+            f"**{len(low_confidence_flagged)} chunk(s) flagged as low-confidence** "
+            f"(a deliberately-broken mutant passed this chunk's own baseline/probe "
+            f"checks — those checks may not have enough coverage to catch a subtle "
+            f"regression here):\n"
+            + "\n".join(f"- {c['kind']} at byte {c['start_byte']}" for c in low_confidence_flagged)
+        )
+    else:
+        parts.append("No chunks flagged as low-confidence by the mutation check.")
+
     return "\n\n".join(parts)
+
+
+def _isolate_probe_baselines(handler, chunks: list[dict]) -> list[dict]:
+    """The `baseline_stdout` recorded on each probe during normal
+    verification is NOT the probe's own isolated output — _verify_candidate
+    runs the WHOLE candidate file with the probe appended (needed to prove
+    the chunk doesn't break the rest of the file when spliced in), so that
+    baseline is contaminated by the original file's own top-level side
+    effects (confirmed by a real run: a file with its own `print(add(2,3))`
+    at the bottom produced baseline_stdout='5\\n5\\n' for a probe that
+    itself only prints once). A durable regression test should isolate the
+    function under test, not replicate that whole-file artifact — so this
+    re-runs each probe against JUST the modernized function (already
+    proven correct) to capture a clean, function-only baseline instead of
+    reusing the recorded one. One extra sandbox call per probe, only when
+    --generate-regression-tests is on; skipped entirely otherwise."""
+    isolated = []
+    for chunk in chunks:
+        clean_probes = []
+        for probe in chunk["probes"]:
+            candidate = (
+                chunk["modernized_code"].encode("utf-8") + b"\n" + probe["snippet"].encode("utf-8") + b"\n"
+            )
+            result = verify(candidate.decode("utf-8"), handler.sandbox_filename, handler.run_command())
+            if result["status"] == "success":
+                clean_probes.append({"snippet": probe["snippet"], "baseline_stdout": result["stdout"]})
+        isolated.append({"modernized_code": chunk["modernized_code"], "probes": clean_probes})
+    return isolated
+
+
+def _resolve_interactive_review(final_state: dict) -> dict:
+    """Synchronously prompt the user right here in the terminal for a
+    chunk modernize() paused on (status "awaiting_review"), then resume
+    the SAME LangGraph review thread with their decision — all within
+    this one CLI invocation, no separate command needed later. Returns
+    final_state with status rewritten to "success" (approved) or
+    "gave_up" (rejected), matching the two statuses every other code
+    path already handles, so nothing downstream needs to know
+    interactive mode was involved at all."""
+    print("\n--- Chunk flagged for review ---")
+    if final_state.get("risk_flag"):
+        print(f"  RISK: {final_state.get('risk_reason', '')}")
+    if final_state.get("security_flag"):
+        for f in final_state.get("security_findings", []):
+            print(f"  SECURITY: {f['rule_id']} (line {f['line']}): {f['message']}")
+    if final_state.get("mutation_confidence_flag"):
+        print(f"  LOW CONFIDENCE: {final_state.get('mutation_confidence_reason', '')}")
+    print(f"\n{final_state['modernized_code']}\n")
+    answer = input("Approve this chunk? [y/N]: ").strip().lower()
+    approved = answer in ("y", "yes")
+    resume_review(final_state["review_thread_id"], approved=approved)
+    if approved:
+        return {**final_state, "status": "success"}
+    return {**final_state, "status": "gave_up", "compiler_stderr": "Rejected during interactive review."}
 
 
 def run_file(
     file_path: str, open_pr: bool, max_iterations: int,
     standalone_pr: bool = True, sibling_sources: list[bytes] | None = None,
+    generate_regression_tests: bool = False, interactive: bool = False,
 ) -> dict:
     """Modernize one file. Returns a stats dict (also the data source for
     --report) rather than just printing, so repo mode can aggregate
@@ -141,12 +226,15 @@ def run_file(
         "chunks_succeeded": 0,
         "chunks_already_modern": 0,
         "chunks_gave_up": 0,
+        "chunks_budget_exceeded": 0,
         "risk_flagged": [],
         "security_flagged": [],
+        "low_confidence_flagged": [],
         "chunk_details": [],
         "output_path": None,
         "final_check_passed": None,
         "pr_url": None,
+        "regression_test_path": None,
         "duration_seconds": None,
     }
 
@@ -159,6 +247,7 @@ def run_file(
     collected_imports: list[str] = []  # merged in once, AFTER the loop —
     # prepending mid-loop would shift byte offsets for chunks not yet
     # processed, since they all sit before the insertion point
+    successful_chunks_for_regression_tests: list[dict] = []
     for chunk in sorted(chunks, key=lambda c: c.start_byte, reverse=True):
         print(f"\n--- Modernizing {chunk.kind} [{chunk.start_byte}:{chunk.end_byte}] ---")
         chunk_start_time = time.time()
@@ -173,10 +262,31 @@ def run_file(
             })
             continue
 
-        final_state = modernize(
-            handler.name, working_source, chunk.start_byte, chunk.end_byte,
-            max_iterations=max_iterations, sibling_sources=sibling_sources,
-        )
+        try:
+            final_state = modernize(
+                handler.name, working_source, chunk.start_byte, chunk.end_byte,
+                max_iterations=max_iterations, sibling_sources=sibling_sources,
+                interactive=interactive,
+            )
+            if final_state["status"] == "awaiting_review":
+                final_state = _resolve_interactive_review(final_state)
+        except BudgetExceededError as e:
+            # Stop processing THIS file's remaining chunks entirely rather
+            # than let the exception propagate and crash the run (single-
+            # file mode has no caller to catch it) or, worse, silently
+            # keep looping and hitting the identical error on every
+            # remaining chunk. The chunks already modernized before this
+            # point are kept — only what's left unprocessed is skipped.
+            print(f"STOPPED: {e}")
+            remaining = [c for c in chunks if c.start_byte <= chunk.start_byte]
+            stats["chunks_budget_exceeded"] += len(remaining)
+            for c in remaining:
+                stats["chunk_details"].append({
+                    "kind": c.kind, "start_byte": c.start_byte,
+                    "status": "budget_exceeded", "iterations": 0,
+                    "duration_seconds": 0.0,
+                })
+            break
         print(f"status={final_state['status']} iterations={final_state['iteration_count']}")
 
         chunk_detail = {
@@ -188,6 +298,7 @@ def run_file(
             "probe_count": len(final_state.get("probes") or []),
             "risk_flag": final_state.get("risk_flag", False),
             "security_flag": final_state.get("security_flag", False),
+            "mutation_confidence_flag": final_state.get("mutation_confidence_flag", False),
             "duration_seconds": time.time() - chunk_start_time,
         }
 
@@ -209,6 +320,10 @@ def run_file(
             for m in final_state.get("required_imports", []):
                 if m not in collected_imports:
                     collected_imports.append(m)
+            successful_chunks_for_regression_tests.append({
+                "modernized_code": final_state["modernized_code"],
+                "probes": final_state.get("probes") or [],
+            })
             if final_state.get("risk_flag"):
                 reason = final_state.get("risk_reason", "")
                 print(f"    RISK FLAGGED: {reason}")
@@ -222,6 +337,11 @@ def run_file(
                     print(f"      - {f['rule_id']} (line {f['line']}): {f['message']}")
                 stats["security_flagged"].append({
                     "kind": chunk.kind, "start_byte": chunk.start_byte, "findings": findings,
+                })
+            if final_state.get("mutation_confidence_flag"):
+                print(f"    LOW CONFIDENCE: {final_state.get('mutation_confidence_reason', '')}")
+                stats["low_confidence_flagged"].append({
+                    "kind": chunk.kind, "start_byte": chunk.start_byte,
                 })
             stats["chunks_succeeded"] += 1
         else:
@@ -257,6 +377,19 @@ def run_file(
         f"({succeeded}/{len(chunks)} chunks modernized, "
         f"{already_modern_count} already modern/skipped)"
     )
+
+    if generate_regression_tests:
+        isolated_chunks = _isolate_probe_baselines(handler, successful_chunks_for_regression_tests)
+        test_source = generate_regression_test_file(handler.name, isolated_chunks)
+        if test_source is None:
+            print("\n--generate-regression-tests: no probes captured for this file — nothing to write.")
+        else:
+            test_path = regression_test_filename(handler.name, file_path)
+            with open(test_path, "w") as f:
+                f.write(test_source)
+            stats["regression_test_path"] = test_path
+            print(f"Wrote durable regression test to {test_path} (from captured verification probes)")
+
     if stats["risk_flagged"]:
         print(f"\n{len(stats['risk_flagged'])} chunk(s) flagged for manual review:")
         for r in stats["risk_flagged"]:
@@ -266,6 +399,10 @@ def run_file(
         for s in stats["security_flagged"]:
             for f in s["findings"]:
                 print(f"  - {s['kind']} at byte {s['start_byte']}: {f['rule_id']} — {f['message']}")
+    if stats["low_confidence_flagged"]:
+        print(f"\n{len(stats['low_confidence_flagged'])} chunk(s) flagged as low-confidence (mutation check):")
+        for c in stats["low_confidence_flagged"]:
+            print(f"  - {c['kind']} at byte {c['start_byte']}")
 
     # Each chunk was only ever verified against its immediate predecessor
     # at the time it was modernized — never against the FINAL combination
@@ -315,7 +452,7 @@ def run_file(
                 f"{succeeded}/{len(chunks)} chunks successfully modernized "
                 f"and verified in an isolated sandbox "
                 f"({already_modern_count} already modern, skipped).\n\n"
-                + _format_flags_section(stats["risk_flagged"], stats["security_flagged"])
+                + _format_flags_section(stats["risk_flagged"], stats["security_flagged"], stats["low_confidence_flagged"])
             ),
         )
         stats["pr_url"] = url
@@ -396,6 +533,7 @@ def _read_all_file_contents(files: list[str]) -> dict[str, bytes]:
 
 def _run_files_concurrently(
     files: list[str], open_pr: bool, max_iterations: int, workers: int, file_contents: dict[str, bytes],
+    generate_regression_tests: bool = False,
 ) -> list[dict]:
     """Run run_file() for independent files in parallel. Safe because
     files don't share state — only chunks WITHIN a single file have an
@@ -410,7 +548,9 @@ def _run_files_concurrently(
         future_to_index = {}
         for i, file_path in enumerate(files):
             siblings = [content for fp, content in file_contents.items() if fp != file_path]
-            future = executor.submit(run_file, file_path, open_pr, max_iterations, False, siblings)
+            future = executor.submit(
+                run_file, file_path, open_pr, max_iterations, False, siblings, generate_regression_tests,
+            )
             future_to_index[future] = i
         for future in as_completed(future_to_index):
             i = future_to_index[future]
@@ -423,11 +563,37 @@ def _run_files_concurrently(
     return results
 
 
-def run_repo(root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1) -> list[dict]:
+def run_repo(
+    root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1, run_target_tests: bool = False,
+    generate_regression_tests: bool = False, interactive: bool = False,
+) -> list[dict]:
+    global _last_target_test_result
+    _last_target_test_result = None
+    if interactive and workers > 1:
+        # A synchronous input() prompt from N concurrent threads at once
+        # is a genuinely broken UX (garbled, unpredictable terminal
+        # output, no way to tell which file a prompt belongs to) — not
+        # just noisier than the existing "console output WILL interleave"
+        # warning for concurrent mode, actually unusable. Refuse clearly
+        # rather than let it silently misbehave.
+        raise ValueError("--interactive is not supported with --workers > 1 (concurrent prompts would garble the terminal). Run with --workers 1.")
     files = discover_files(root_dir)
     print(f"Found {len(files)} modernizable file(s) under {root_dir}")
 
     file_contents = _read_all_file_contents(files)
+
+    baseline_test_result = None
+    test_framework = None
+    if run_target_tests:
+        detected = detect_test_command(root_dir)
+        if detected is None:
+            print("\n--run-target-tests: no recognized test framework found at repo root — skipping.")
+        else:
+            test_framework, test_command = detected
+            print(f"\n--run-target-tests: running {test_framework}'s existing test suite as a baseline "
+                  f"(BEFORE modernization, on the untouched repo)...")
+            baseline_test_result = run_test_command(root_dir, test_command)
+            print(f"Baseline: {baseline_test_result['status']}")
 
     if workers > 1:
         print(
@@ -438,10 +604,22 @@ def run_repo(root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1
             f"--report for clean structured results instead of reading "
             f"the terminal for a concurrent run."
         )
-        all_stats = _run_files_concurrently(files, open_pr, max_iterations, workers, file_contents)
+        all_stats = _run_files_concurrently(
+            files, open_pr, max_iterations, workers, file_contents, generate_regression_tests,
+        )
     else:
         all_stats = []
         for i, file_path in enumerate(files, 1):
+            if llm_budget.is_exceeded():
+                # Stop BEFORE starting a new file, not after hitting the
+                # same BudgetExceededError on its very first chunk — the
+                # remaining files are cleanly reported as never attempted
+                # rather than each showing up as its own "ERROR".
+                remaining = len(files) - i + 1
+                print(f"\nLLM call budget exhausted — stopping before {remaining} remaining file(s).")
+                for skipped_path in files[i - 1:]:
+                    all_stats.append({"file_path": skipped_path, "error": "budget_exceeded"})
+                break
             print(f"\n{'=' * 60}\n[{i}/{len(files)}] {file_path}\n{'=' * 60}")
             siblings = [content for fp, content in file_contents.items() if fp != file_path]
             try:
@@ -450,22 +628,53 @@ def run_repo(root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1
                 stats = run_file(
                     file_path, open_pr, max_iterations,
                     standalone_pr=False, sibling_sources=siblings,
+                    generate_regression_tests=generate_regression_tests,
+                    interactive=interactive,
                 )
             except Exception as e:
                 print(f"ERROR processing {file_path}: {e}")
                 stats = {"file_path": file_path, "error": str(e)}
             all_stats.append(stats)
 
+    if run_target_tests and test_framework is not None:
+        overlay_files = {
+            os.path.relpath(s["file_path"], root_dir): open(s["output_path"]).read()
+            for s in all_stats if s.get("output_path")
+        }
+        if not overlay_files:
+            print(f"\n--run-target-tests: no files were successfully modernized — nothing to re-test.")
+        else:
+            print(
+                f"\n--run-target-tests: re-running {test_framework}'s test suite against a TEMPORARY "
+                f"copy of the repo with {len(overlay_files)} modernized file(s) overlaid "
+                f"(your real working tree is never touched)..."
+            )
+            after_result = run_target_tests_on_copy(root_dir, overlay_files)
+            regressed = (
+                baseline_test_result is not None and after_result is not None
+                and baseline_test_result["status"] == "success" and after_result["status"] != "success"
+            )
+            print(f"After: {after_result['status'] if after_result else 'error'}"
+                  + (" — REGRESSION vs baseline" if regressed else ""))
+            _last_target_test_result = {
+                "framework": test_framework,
+                "baseline": baseline_test_result,
+                "after": after_result,
+                "regressed": regressed,
+            }
+
     print(f"\n{'=' * 60}\nRepo summary ({len(files)} file(s))\n{'=' * 60}")
     total_succeeded = sum(s.get("chunks_succeeded", 0) for s in all_stats)
     total_chunks = sum(s.get("chunks_total", 0) for s in all_stats)
     total_risk = sum(len(s.get("risk_flagged", [])) for s in all_stats)
     total_security = sum(len(s.get("security_flagged", [])) for s in all_stats)
+    total_low_confidence = sum(len(s.get("low_confidence_flagged", [])) for s in all_stats)
     files_written = sum(1 for s in all_stats if s.get("output_path"))
     print(f"Chunks modernized: {total_succeeded}/{total_chunks}")
     print(f"Files with output written: {files_written}/{len(files)}")
     print(f"Chunks flagged for manual review: {total_risk}")
     print(f"Chunks flagged by security scan: {total_security}")
+    print(f"Chunks flagged as low-confidence (mutation check): {total_low_confidence}")
 
     if open_pr:
         pr_url = _open_combined_pr(root_dir, all_stats)
@@ -481,10 +690,28 @@ def run_repo(root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1
 def _open_combined_pr(root_dir: str, all_stats: list[dict]) -> str | None:
     """Gather every file whose final behavioral check passed AND whose
     language has a proven-enough track record, and open ONE PR containing
-    all of them, instead of one PR per file. A repo can span languages
-    with very different track records (e.g. Python well-proven, PHP
-    brand new to this tool) — each file's eligibility is checked against
-    ITS OWN language, not the repo as a whole."""
+    all of them, instead of one PR per file.
+
+    A repo can span languages with very different track records (e.g.
+    Python well-proven, PHP brand new to this tool) — each file's
+    eligibility is checked against ITS OWN language, not the repo as a
+    whole.
+
+    If --run-target-tests found a regression (the target repo's OWN
+    pre-existing test suite passed before modernization and doesn't
+    after), refuse the PR outright — an independent, human-authored
+    oracle is a strictly stronger signal than anything this project
+    generates itself, so it gates PR eligibility the same way
+    final_check_passed does."""
+    if _last_target_test_result and _last_target_test_result.get("regressed"):
+        print(
+            "\nRefusing to open a PR: --run-target-tests found a regression "
+            f"({_last_target_test_result['framework']}'s test suite passed before "
+            "modernization and doesn't after). Inspect the *.modernized.* files "
+            "manually before proposing them."
+        )
+        return None
+
     checked_passed = [s for s in all_stats if s.get("final_check_passed") and s.get("output_path")]
     if not checked_passed:
         print("\nNo files passed their final check — no PR to open.")
@@ -511,6 +738,7 @@ def _open_combined_pr(root_dir: str, all_stats: list[dict]) -> str | None:
 
     all_risk_flagged = [r for s in eligible for r in s.get("risk_flagged", [])]
     all_security_flagged = [f for s in eligible for f in s.get("security_flagged", [])]
+    all_low_confidence_flagged = [c for s in eligible for c in s.get("low_confidence_flagged", [])]
     skipped = len(all_stats) - len(eligible)
     branch_name = f"chore/modernize-repo-{int(time.time())}"
 
@@ -524,7 +752,7 @@ def _open_combined_pr(root_dir: str, all_stats: list[dict]) -> str | None:
             f"({sum(s['chunks_succeeded'] for s in eligible)} chunks modernized total).\n"
             + (f"{skipped} file(s) skipped (failed their final check or language "
                f"track record).\n" if skipped else "")
-            + "\n" + _format_flags_section(all_risk_flagged, all_security_flagged)
+            + "\n" + _format_flags_section(all_risk_flagged, all_security_flagged, all_low_confidence_flagged)
         ),
     )
 
@@ -542,6 +770,8 @@ def write_report(report_path: str, mode: str, results: list[dict]) -> None:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
         "results": results,
+        "llm_usage": llm_budget.summary(),
+        "target_test_result": _last_target_test_result,
     }
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
@@ -568,14 +798,79 @@ if __name__ == "__main__":
              "Each worker runs its own Docker containers and LLM calls — mind your machine's "
              "CPU/memory and Ollama's own concurrency limits before raising this.",
     )
+    parser.add_argument(
+        "--max-llm-calls", type=int, default=_settings.get("max_llm_calls_per_run"),
+        help="Hard ceiling on total LLM calls for this run (default: unlimited). A circuit "
+             "breaker for repo-mode runs, where best-of-N x retry-iterations x probes x "
+             "chunks x files can multiply fast with nothing capping it otherwise — once hit, "
+             "remaining chunks/files are cleanly skipped rather than the run crashing or "
+             "silently continuing forever.",
+    )
+    parser.add_argument(
+        "--run-target-tests", action="store_true", default=_settings.get("run_target_tests", False),
+        help="Repo mode only. If the target repo has a recognized test suite (pytest, "
+             "npm test, PHPUnit, Maven/Gradle), run it BEFORE modernization (baseline, "
+             "untouched repo) and AFTER (a TEMPORARY COPY with modernized files overlaid — "
+             "your real working tree is never touched). Unlike everything else in this "
+             "project, this runs the test command directly on the HOST, not the sandbox: "
+             "it needs the target repo's own installed dependencies, which only exist there. "
+             "A regression (baseline passed, after doesn't) refuses --pr for this run.",
+    )
+    parser.add_argument(
+        "--generate-regression-tests", action="store_true",
+        default=_settings.get("generate_regression_tests", False),
+        help="For each successfully modernized chunk, write its captured verification "
+             "probes (real call sites + LLM-synthesized examples, already proven to match "
+             "the original's behavior) into a standalone, durable test file next to the "
+             "output — turning this run's verification into lasting test coverage that "
+             "needs neither this project nor an LLM to re-check later. New sibling file "
+             "only (e.g. test_calc_modernized.py) — never overwrites anything. Supported "
+             "for python/javascript/typescript/php (the languages that generate probes at "
+             "all); a no-op for cpp/java.",
+    )
+    parser.add_argument(
+        "--interactive", action="store_true", default=_settings.get("interactive", False),
+        help="Pause on any chunk flagged (risk, security, or low-confidence mutation check) "
+             "and prompt right here in the terminal to approve or reject it, instead of just "
+             "flagging and continuing. Uses LangGraph's native interrupt()/Command mechanism "
+             "under the hood — approve keeps the chunk as a success, reject treats it like "
+             "any other failed chunk (not written to output). Not supported with --workers > 1 "
+             "(concurrent prompts would garble the terminal).",
+    )
     args = parser.parse_args()
 
+    if args.interactive and args.workers > 1:
+        parser.error("--interactive is not supported with --workers > 1 (concurrent prompts would garble the terminal)")
+
+    # Reset ONCE here, at the true top-level entry point — never inside
+    # run_file/run_repo themselves, or a repo-wide budget would silently
+    # reset per file instead of accumulating across the whole run (see
+    # LLMBudget.reset's docstring).
+    llm_budget.reset(max_calls=args.max_llm_calls)
+
     if os.path.isdir(args.path):
-        results = run_repo(args.path, args.pr, args.max_iterations, args.workers)
+        results = run_repo(
+            args.path, args.pr, args.max_iterations, args.workers,
+            args.run_target_tests, args.generate_regression_tests, args.interactive,
+        )
         mode = "repo"
     else:
-        results = [run_file(args.path, args.pr, args.max_iterations)]
+        results = [run_file(
+            args.path, args.pr, args.max_iterations,
+            generate_regression_tests=args.generate_regression_tests,
+            interactive=args.interactive,
+        )]
         mode = "file"
+
+    _usage = llm_budget.summary()
+    print(
+        f"\nLLM calls this run: {_usage['total_calls']}"
+        + (f" (budget: {_usage['max_calls']})" if _usage["max_calls"] is not None else "")
+    )
+    if _usage["total_input_tokens"] or _usage["total_output_tokens"]:
+        print(f"Tokens: {_usage['total_input_tokens']} in / {_usage['total_output_tokens']} out")
+    if _usage["calls_by_model"]:
+        print("By model: " + ", ".join(f"{m}={c}" for m, c in _usage["calls_by_model"].items()))
 
     # Fold THIS run's per-language results into the persisted track
     # record for NEXT time. Deliberately happens after every run, whether

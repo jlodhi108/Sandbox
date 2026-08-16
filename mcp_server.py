@@ -77,6 +77,15 @@ def _protect_stdout():
         yield
 
 
+def _configured_max_llm_calls() -> int | None:
+    """.modernizer.toml's [settings].max_llm_calls_per_run, if set —
+    the same value main.py's CLI reads as its --max-llm-calls default.
+    Read fresh on every call rather than cached, so editing the config
+    file takes effect on this long-lived server's NEXT tool call without
+    a restart."""
+    return main._config.get("settings", {}).get("max_llm_calls_per_run")
+
+
 def _update_track_record(results: list[dict]) -> None:
     """Mirrors main.py's __main__ block: fold this run's results into
     the persisted track record, whether or not a PR was requested — an
@@ -100,7 +109,10 @@ def _update_track_record(results: list[dict]) -> None:
 
 
 @mcp.tool
-def modernize_file(file_path: str, max_iterations: int = 5, open_pr: bool = False) -> dict:
+def modernize_file(
+    file_path: str, max_iterations: int = 5, open_pr: bool = False, max_llm_calls: int | None = None,
+    generate_regression_tests: bool = False,
+) -> dict:
     """Modernize one legacy source file (C++/Python/JS/TS/Java/PHP,
     detected from its extension). file_path should be an ABSOLUTE path —
     this server runs from its own project directory, so a relative path
@@ -120,17 +132,41 @@ def modernize_file(file_path: str, max_iterations: int = 5, open_pr: bool = Fals
     GITHUB_REPO configured in the environment. Leave this False to just
     generate the modernized file for your own review first.
 
-    Returns a stats dict: chunks_total/succeeded/already_modern/gave_up,
-    output_path, final_check_passed, pr_url, and a chunk_details list
-    (per-chunk status, diff, risk/security flags)."""
+    max_llm_calls caps total LLM calls for THIS call only (overriding
+    .modernizer.toml's max_llm_calls_per_run for just this run; omit to
+    use whatever that file configures, or leave both unset for
+    unlimited). If the cap is hit mid-file, chunks already modernized
+    are kept and the rest are cleanly marked "budget_exceeded" in
+    chunk_details rather than the call failing.
+
+    generate_regression_tests=True additionally writes each successfully
+    modernized chunk's captured verification probes into a standalone,
+    durable test file next to the output (e.g. calc.py ->
+    test_calc_modernized.py) — turning this run's verification into
+    lasting test coverage that needs neither this project nor an LLM to
+    re-check later. Always a NEW sibling file, never overwrites anything.
+    Supported for python/javascript/typescript/php (the languages that
+    generate probes at all); a no-op for cpp/java.
+
+    Returns a stats dict: chunks_total/succeeded/already_modern/gave_up/
+    budget_exceeded, output_path, regression_test_path, final_check_passed,
+    pr_url, a chunk_details list (per-chunk status, diff, risk/security/
+    mutation-confidence flags), and llm_usage (calls/tokens actually
+    spent on this run)."""
     with _protect_stdout():
-        stats = main.run_file(file_path, open_pr, max_iterations)
+        main.llm_budget.reset(max_calls=max_llm_calls or _configured_max_llm_calls())
+        stats = main.run_file(file_path, open_pr, max_iterations, generate_regression_tests=generate_regression_tests)
         _update_track_record([stats])
+    stats["llm_usage"] = main.llm_budget.summary()
     return stats
 
 
 @mcp.tool
-def modernize_repo(root_dir: str, max_iterations: int = 5, workers: int = 1, open_pr: bool = False) -> dict:
+def modernize_repo(
+    root_dir: str, max_iterations: int = 5, workers: int = 1, open_pr: bool = False,
+    max_llm_calls: int | None = None, run_target_tests: bool = False,
+    generate_regression_tests: bool = False,
+) -> dict:
     """Modernize every supported source file under root_dir (recursive,
     .gitignore-aware, skips node_modules/.git/build output dirs etc.).
     root_dir should be an ABSOLUTE path — this server runs from its own
@@ -149,10 +185,42 @@ def modernize_repo(root_dir: str, max_iterations: int = 5, workers: int = 1, ope
     Docker containers and LLM calls — mind local CPU/memory and Ollama's
     own concurrency limits before raising this).
 
+    max_llm_calls caps total LLM calls across the WHOLE repo run (all
+    files combined), overriding .modernizer.toml's max_llm_calls_per_run
+    for just this call — a real safety net for repo mode, where
+    best-of-N x retry-iterations x probes x chunks x files can multiply
+    fast. Once hit, remaining files are cleanly reported as never
+    attempted (error: "budget_exceeded") rather than the run failing.
+
+    run_target_tests=True additionally runs the target repo's OWN
+    pre-existing test suite (pytest/npm test/PHPUnit/Maven/Gradle, if
+    one is detected at root_dir) before AND after modernization — an
+    independent, human-authored oracle, materially different from
+    everything else in this project: it executes directly on the HOST
+    (not the sandbox), because it needs the target repo's own installed
+    dependencies. It only ever runs against a TEMPORARY COPY of the repo
+    with modernized files overlaid, never root_dir itself. A regression
+    (baseline passed, after doesn't) refuses open_pr for this call.
+
     Returns {"files": [...one stats dict per file, see modernize_file...],
-    "summary": {...aggregate totals across the run...}}."""
+    "summary": {...aggregate totals...}, "llm_usage": {...calls/tokens
+    actually spent across the whole run...}, "target_test_result":
+    {...framework, baseline, after, regressed...} or None if
+    run_target_tests was False or no framework was detected}.
+
+    generate_regression_tests=True additionally writes each successfully
+    modernized chunk's captured verification probes into a standalone,
+    durable test file next to its output (e.g. calc.py ->
+    test_calc_modernized.py, one per source file) — turning this run's
+    verification into lasting test coverage that needs neither this
+    project nor an LLM to re-check later. Always a NEW sibling file,
+    never overwrites anything. Supported for python/javascript/
+    typescript/php; a no-op for cpp/java."""
     with _protect_stdout():
-        results = main.run_repo(root_dir, open_pr, max_iterations, workers)
+        main.llm_budget.reset(max_calls=max_llm_calls or _configured_max_llm_calls())
+        results = main.run_repo(
+            root_dir, open_pr, max_iterations, workers, run_target_tests, generate_regression_tests,
+        )
         _update_track_record(results)
     return {
         "files": results,
@@ -164,6 +232,8 @@ def modernize_repo(root_dir: str, max_iterations: int = 5, workers: int = 1, ope
             "chunks_flagged_risk": sum(len(r.get("risk_flagged", [])) for r in results),
             "chunks_flagged_security": sum(len(r.get("security_flagged", [])) for r in results),
         },
+        "target_test_result": main._last_target_test_result,
+        "llm_usage": main.llm_budget.summary(),
     }
 
 

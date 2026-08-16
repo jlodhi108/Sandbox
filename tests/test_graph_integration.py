@@ -45,6 +45,23 @@ def _no_real_security_scan():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_mutation_check():
+    """check_mutation_confidence() makes an EXTRA LLM call (generate_mutant)
+    and an extra verify() call on top of everything else in
+    agents.graph.modernize() — both against the same agents.nodes.llm/
+    verify each test already mocks for the main graph flow, so this
+    doesn't add a genuine Docker/Ollama dependency the way scan_security
+    did, but it DOES silently add one more call to both, throwing off
+    any test that asserts an exact call_count or relies on QueuedVerify's
+    result ordering (confirmed: broke two pre-existing call-count
+    assertions the moment this was wired in). autouse for the same
+    reason as the fixtures above — isolated by default, dedicated tests
+    below opt back in explicitly."""
+    with patch("agents.graph.check_mutation_confidence", return_value=(False, "")):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _single_candidate_by_default():
     """refactorer_node generates BEST_OF_N_ON_FIRST_ATTEMPT candidates on
     iteration 0 — by default 2, the second coming from _diversity_llm, a
@@ -183,9 +200,11 @@ def test_escalates_to_stronger_model_after_threshold():
     assert final_state["status"] == "success"
     # base model tried exactly twice (iteration_count 0 and 1, both below
     # threshold 2), then escalation model took over and got it right on
-    # its first attempt. base_llm gets ONE more call after that: risk
-    # assessment always uses the base model by design, regardless of
-    # escalation state (see assess_risk's docstring) — so 3 total, not 2.
+    # its first attempt. base_llm gets ONE more call after that: the
+    # winning candidate was written by escalation_llm, so assess_risk
+    # deliberately reviews with the OTHER model (base) — a model doesn't
+    # review its own output (see _select_reviewer_llm's docstring) — so
+    # 3 total, not 2.
     assert base_llm.call_count == 3
     assert escalation_llm.call_count == 1
 
@@ -206,6 +225,118 @@ def test_risk_assessment_result_flows_into_final_state():
     assert final_state["status"] == "success"
     assert final_state["risk_flag"] is True
     assert "global counter" in final_state["risk_reason"]
+
+
+def test_mutation_confidence_result_flows_into_final_state():
+    # Mirrors test_risk_assessment_result_flows_into_final_state's
+    # approach: fake the check itself (already unit-tested directly in
+    # test_nodes.py) rather than re-deriving its internal LLM/verify call
+    # sequence here — this test only proves the WIRING from
+    # check_mutation_confidence's return value into final_state.
+    fake_llm = ScriptedLLM([
+        "int add(int a, int b) { return a + b; }",
+        _RISK_NO,
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None), \
+         patch("agents.graph.check_mutation_confidence", return_value=(True, "checks had no bite")):
+        final_state = modernize("cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")), max_iterations=5)
+
+    assert final_state["status"] == "success"
+    assert final_state["mutation_confidence_flag"] is True
+    assert final_state["mutation_confidence_reason"] == "checks had no bite"
+
+
+def test_mutation_confidence_not_run_when_chunk_fails():
+    # Same "post-success only" cost discipline as risk/security checks —
+    # no point mutating and re-verifying a chunk that never passed in
+    # the first place.
+    fake_llm = ScriptedLLM(["int add(int a, int b) { return a - b; }"])  # always wrong
+    fake_verify = QueuedVerify([_OK, _FAIL])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None), \
+         patch("agents.graph.check_mutation_confidence") as mock_mutation_check:
+        final_state = modernize("cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")), max_iterations=1)
+
+    assert final_state["status"] == "gave_up"
+    mock_mutation_check.assert_not_called()
+
+
+def test_interactive_false_never_pauses_even_when_flagged():
+    # Default behavior must stay completely unchanged: a flagged chunk
+    # still comes back "success" with the flag set, exactly as before
+    # this feature existed, unless interactive=True is explicitly passed.
+    fake_llm = ScriptedLLM([
+        "int add(int a, int b) { return a + b; }",
+        "RISK: yes\nTouches global state.",
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None):
+        final_state = modernize(
+            "cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")), max_iterations=5, interactive=False,
+        )
+
+    assert final_state["status"] == "success"
+    assert final_state["risk_flag"] is True
+    assert final_state["review_thread_id"] is None
+
+
+def test_interactive_true_pauses_on_flagged_chunk_and_resumes_on_approval():
+    from agents.review_graph import resume_review
+
+    fake_llm = ScriptedLLM([
+        "int add(int a, int b) { return a + b; }",
+        "RISK: yes\nTouches global state.",
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None):
+        final_state = modernize(
+            "cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")), max_iterations=5, interactive=True,
+        )
+
+    assert final_state["status"] == "awaiting_review"
+    assert final_state["risk_flag"] is True
+    assert final_state["review_thread_id"] is not None
+
+    resumed = resume_review(final_state["review_thread_id"], approved=True)
+    assert resumed["status"] == "approved"
+
+
+def test_interactive_true_still_completes_normally_when_nothing_flagged():
+    # An unflagged chunk in interactive mode must NOT pause at all — the
+    # review graph auto-approves without ever calling interrupt() when
+    # no flag is set (see review_graph.py's _review_node).
+    fake_llm = ScriptedLLM([
+        "int add(int a, int b) { return a + b; }",
+        _RISK_NO,
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None):
+        final_state = modernize(
+            "cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")), max_iterations=5, interactive=True,
+        )
+
+    assert final_state["status"] == "success"
+    assert final_state["review_thread_id"] is None
 
 
 def test_probe_mismatch_fails_even_when_whole_file_check_passes():

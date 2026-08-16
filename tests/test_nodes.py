@@ -408,6 +408,60 @@ def test_assess_risk_defaults_to_not_flagged_on_unparseable_response():
         assert risk_flag is False
 
 
+def test_select_reviewer_llm_prefers_explicit_reviewer_model():
+    from agents.nodes import _select_reviewer_llm
+
+    fake_reviewer = MagicMock()
+    fake_escalation = MagicMock()
+    with patch("agents.nodes.reviewer_llm", fake_reviewer), \
+         patch("agents.nodes.escalation_llm", fake_escalation):
+        assert _select_reviewer_llm(used_escalation=False) is fake_reviewer
+        assert _select_reviewer_llm(used_escalation=True) is fake_reviewer
+
+
+def test_select_reviewer_llm_uses_escalation_model_when_base_wrote_the_code():
+    from agents.nodes import _select_reviewer_llm, llm
+
+    fake_escalation = MagicMock()
+    with patch("agents.nodes.reviewer_llm", None), \
+         patch("agents.nodes.escalation_llm", fake_escalation):
+        assert _select_reviewer_llm(used_escalation=False) is fake_escalation
+
+
+def test_select_reviewer_llm_uses_base_model_when_escalation_wrote_the_code():
+    from agents.nodes import _select_reviewer_llm, llm
+
+    fake_escalation = MagicMock()
+    with patch("agents.nodes.reviewer_llm", None), \
+         patch("agents.nodes.escalation_llm", fake_escalation):
+        assert _select_reviewer_llm(used_escalation=True) is llm
+
+
+def test_select_reviewer_llm_falls_back_to_base_with_zero_extra_config():
+    from agents.nodes import _select_reviewer_llm, llm
+
+    with patch("agents.nodes.reviewer_llm", None), \
+         patch("agents.nodes.escalation_llm", None):
+        assert _select_reviewer_llm(used_escalation=False) is llm
+        assert _select_reviewer_llm(used_escalation=True) is llm
+
+
+def test_assess_risk_passes_used_escalation_through_to_reviewer_selection():
+    from agents.nodes import assess_risk
+
+    mock_response = MagicMock()
+    mock_response.content = "RISK: no\nPure function."
+    fake_escalation = MagicMock()
+    fake_escalation.invoke.return_value = mock_response
+    with patch("agents.nodes.reviewer_llm", None), \
+         patch("agents.nodes.escalation_llm", fake_escalation), \
+         patch("agents.nodes.llm") as mock_base_llm:
+        risk_flag, _ = assess_risk("def add(a, b):\n    return a + b", used_escalation=False)
+        assert risk_flag is False
+        fake_escalation.invoke.assert_called_once()  # base wrote it, escalation reviews
+        mock_base_llm.invoke.assert_not_called()
+
+
 def test_generate_probes_returns_list_of_snippets():
     from agents.nodes import generate_probes
 
@@ -592,3 +646,117 @@ def test_scan_security_uses_correct_filename_for_language():
         mock_semgrep.return_value = {"status": "success", "findings": []}
         scan_security("php", "<?php\nfunction f() {}")
         assert mock_semgrep.call_args[0][1] == "main.php"
+
+
+def test_generate_mutant_strips_fence_and_extracts_requires():
+    from agents.nodes import generate_mutant
+
+    mock_response = MagicMock()
+    mock_response.content = "```python\n# REQUIRES: math\ndef add(a, b):\n    return a - b\n```"
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        result = generate_mutant("python", "def add(a, b):\n    return a + b")
+        assert result is not None
+        mutant_code, required_imports = result
+        assert mutant_code == "def add(a, b):\n    return a - b"
+        assert required_imports == ["math"]
+
+
+def test_generate_mutant_returns_none_when_identical_to_original():
+    from agents.nodes import generate_mutant
+
+    original = "def add(a, b):\n    return a + b"
+    mock_response = MagicMock()
+    mock_response.content = original
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        assert generate_mutant("python", original) is None
+
+
+def test_generate_mutant_returns_none_on_empty_response():
+    from agents.nodes import generate_mutant
+
+    mock_response = MagicMock()
+    mock_response.content = ""
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        assert generate_mutant("python", "def add(a, b):\n    return a + b") is None
+
+
+def test_check_mutation_confidence_flags_when_mutant_passes_verification():
+    # The mutant (a - b, deliberately wrong) is fed through the same
+    # verification the real modernization already passed. If verify()
+    # reports success for the mutant too, that means THIS chunk's checks
+    # didn't distinguish broken from correct — the signal this whole
+    # check exists to surface.
+    from agents.nodes import check_mutation_confidence
+    from languages.python_lang import PythonHandler
+
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "baseline_stdout": None,
+        "probes": [],
+    }
+    mock_mutant_response = MagicMock()
+    mock_mutant_response.content = "def add(a, b):\n    return a - b"
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes.verify") as mock_verify:
+        mock_llm.invoke.return_value = mock_mutant_response
+        mock_verify.return_value = {"status": "success", "stderr": "", "stdout": "", "exit_code": 0}
+        flag, reason = check_mutation_confidence(
+            PythonHandler(), state, "def add(a, b):\n    return a + b", []
+        )
+        assert flag is True
+        assert "deliberately broken" in reason
+
+
+def test_check_mutation_confidence_not_flagged_when_mutant_is_caught():
+    # The mutant fails verification (as it should, being genuinely
+    # broken) — this chunk's checks DO have real bite, no flag needed.
+    from agents.nodes import check_mutation_confidence
+    from languages.python_lang import PythonHandler
+
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "baseline_stdout": None,
+        "probes": [],
+    }
+    mock_mutant_response = MagicMock()
+    mock_mutant_response.content = "def add(a, b):\n    return a - b"
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes.verify") as mock_verify:
+        mock_llm.invoke.return_value = mock_mutant_response
+        mock_verify.return_value = {"status": "failed", "stderr": "wrong output", "stdout": "", "exit_code": 1}
+        flag, reason = check_mutation_confidence(
+            PythonHandler(), state, "def add(a, b):\n    return a + b", []
+        )
+        assert flag is False
+        assert reason == ""
+
+
+def test_check_mutation_confidence_skips_cleanly_when_no_mutant_available():
+    from agents.nodes import check_mutation_confidence
+    from languages.python_lang import PythonHandler
+
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "baseline_stdout": None,
+        "probes": [],
+    }
+    mock_response = MagicMock()
+    mock_response.content = "def add(a, b):\n    return a + b"  # identical -> no mutant
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes.verify") as mock_verify:
+        mock_llm.invoke.return_value = mock_response
+        flag, reason = check_mutation_confidence(
+            PythonHandler(), state, "def add(a, b):\n    return a + b", []
+        )
+        assert flag is False
+        assert reason == ""
+        mock_verify.assert_not_called()  # no mutant -> never even tries to verify one

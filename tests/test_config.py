@@ -49,6 +49,18 @@ def test_apply_config_to_environment_never_overrides_existing_env_var():
         os.environ.update(env_backup)
 
 
+def test_apply_config_to_environment_sets_reviewer_model():
+    config = {"escalation": {"reviewer_model": "qwen2.5-coder:1.5b"}}
+    env_backup = dict(os.environ)
+    try:
+        os.environ.pop("REVIEWER_MODEL", None)
+        apply_config_to_environment(config)
+        assert os.environ["REVIEWER_MODEL"] == "qwen2.5-coder:1.5b"
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
+
+
 def test_apply_config_to_environment_sets_github_repo():
     config = {"github": {"repo": "owner/repo"}}
     env_backup = dict(os.environ)

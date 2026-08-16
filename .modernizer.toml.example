@@ -10,10 +10,64 @@
 max_iterations = 5
 workers = 1
 # report = "modernizer-report.json"
+#
+# Hard ceiling on total LLM calls for ONE run (a single file, or a whole
+# repo run) — unset means unlimited. best-of-N x retry-iterations x
+# probes x chunks x files can multiply fast with nothing capping it
+# otherwise; once hit, remaining chunks/files are cleanly skipped
+# (marked budget_exceeded in --report output) rather than the run
+# crashing or silently continuing forever. Actual usage for the run is
+# always printed at the end and included in --report's "llm_usage" key,
+# whether or not this is set.
+# max_llm_calls_per_run = 200
+#
+# Repo mode only. If the target repo has a recognized test suite
+# (pytest, npm test, PHPUnit, Maven/Gradle), run it before AND after
+# modernization to catch regressions an independent, human-authored
+# oracle would catch — see target_tests.py's module docstring for why
+# this runs on the HOST (not the sandbox) and only ever touches a
+# TEMPORARY COPY of the repo, never your real working tree. A regression
+# refuses --pr for that run. Off by default — this is a materially
+# different trust boundary from everything else in this project (real
+# subprocess execution of the target repo's own test command, not a
+# sandboxed container), so it's opt-in even though it never touches your
+# actual files.
+# run_target_tests = true
+#
+# For each successfully modernized chunk, write its captured
+# verification probes into a standalone, durable test file next to the
+# output (e.g. calc.py -> test_calc_modernized.py) — turning this run's
+# verification into lasting test coverage that needs neither this
+# project nor an LLM to re-check later. Always a NEW sibling file, never
+# overwrites anything. Supported for python/javascript/typescript/php
+# (the languages that generate probes at all — see
+# regression_tests.py); a no-op for cpp/java. Off by default simply to
+# avoid writing files the user didn't ask for on every run.
+# generate_regression_tests = true
+#
+# Pause on any chunk flagged (risk, security, or low-confidence mutation
+# check) and prompt right here in the terminal to approve or reject it,
+# instead of just flagging and continuing — see agents/review_graph.py.
+# Uses LangGraph's native interrupt()/Command mechanism: the graph
+# genuinely pauses (checkpointed in memory) and resumes from that exact
+# point once you answer, rather than this being a bolted-on prompt
+# outside the graph. Not supported together with workers > 1 (concurrent
+# prompts would garble the terminal) — CLI refuses that combination.
+# interactive = true
 
 [escalation]
 # model = "qwen2.5-coder:32b"
 # threshold = 3
+#
+# Model used to critique a chunk's risk level (assess_risk) instead of
+# whichever model actually wrote it — a model reviewing its own output
+# is a measurably weak checker, independent of how capable it is (see
+# agents/nodes.py's _select_reviewer_llm for the full fallback chain).
+# Optional: if `model` above is set and this isn't, the escalation
+# model and base model already review each other for free with zero
+# extra config. Set this only if you want a SPECIFIC reviewer regardless
+# of escalation state.
+# reviewer_model = "qwen2.5-coder:1.5b"
 
 [github]
 # repo = "owner/repo"
@@ -31,13 +85,23 @@ workers = 1
 # min_success_rate = 0.8
 
 [sandbox]
+# Every container (execution sandbox AND the semgrep scan) already runs
+# with resource caps + non-root user + no network + a HARDENED seccomp
+# profile (sandbox/seccomp-profile.json, on by default — no config
+# needed, works identically on Linux and macOS Docker Desktop; set
+# DISABLE_SECCOMP_PROFILE=1 as an env var if some future toolchain
+# genuinely needs a syscall it blocks). The setting below is for going
+# further still, specifically for the container that EXECUTES modernized
+# code:
+#
 # Stronger container isolation for the sandbox that EXECUTES modernized
 # code (not the semgrep security scan, which never executes anything).
 # "runsc" = gVisor: a user-space kernel that intercepts syscalls instead
 # of letting them reach the host kernel directly, drastically shrinking
-# the attack surface an escape would need. Plain Docker (the default,
-# this setting unset) relies only on resource caps + non-root user + no
-# network — real hardening, but not the same category of guarantee.
+# the attack surface an escape would need. This is a step beyond the
+# seccomp hardening above, not a replacement for it — real additional
+# isolation, but with real host-setup cost (see below), unlike the
+# seccomp profile.
 #
 # This is a HOST-level, Linux-only setup step this project cannot
 # provide for you: install gVisor (https://gvisor.dev/docs/user_guide/install/)

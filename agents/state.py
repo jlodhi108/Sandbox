@@ -50,7 +50,29 @@ class AgentState(TypedDict):
                              # says nothing about newly introduced
                              # vulnerabilities.
     security_findings: list[dict]  # [{"rule_id", "line", "message"}, ...]
+    mutation_confidence_flag: bool  # set post-graph, only on success: a
+                                      # deliberately-broken mutant of this
+                                      # chunk was generated and run through
+                                      # the SAME baseline+probe checks that
+                                      # just passed — True means the checks
+                                      # did NOT catch the known-broken
+                                      # mutant, i.e. this chunk's specific
+                                      # verification had no real "bite" and
+                                      # its "success" deserves less trust
+                                      # than usual. A DIFFERENT gap than
+                                      # risk_flag/security_flag: this is
+                                      # about the STRENGTH of the check
+                                      # itself, not a property of the code.
+    mutation_confidence_reason: str
+    review_thread_id: str | None  # set post-graph, only when interactive=True
+                                    # AND at least one flag above is set: the
+                                    # id a caller passes to
+                                    # agents.review_graph.resume_review() to
+                                    # approve/reject this chunk. status is
+                                    # "awaiting_review" (not "success") while
+                                    # this is set and unresolved — see
+                                    # modernize()'s interactive handling.
     compiler_stderr: str
     iteration_count: int
-    status: str  # "pending" | "success" | "failed"
+    status: str  # "pending" | "success" | "failed" | "awaiting_review"
     max_iterations: int

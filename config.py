@@ -23,26 +23,29 @@ def load_config(path: str | None = None) -> dict:
 
 def apply_config_to_environment(config: dict) -> None:
     """Push config values that other modules read from os.environ at
-    IMPORT time (ESCALATION_MODEL, ESCALATION_THRESHOLD, GITHUB_REPO)
-    into the environment — using setdefault, so an already-set env var
-    (from the shell, or from .env via load_dotenv()) always wins over
-    the config file. Precedence end to end: CLI flag > env var >
-    .env file > config file > hardcoded default.
+    IMPORT time (ESCALATION_MODEL, ESCALATION_THRESHOLD, REVIEWER_MODEL,
+    GITHUB_REPO) into the environment — using setdefault, so an
+    already-set env var (from the shell, or from .env via load_dotenv())
+    always wins over the config file. Precedence end to end: CLI flag >
+    env var > .env file > config file > hardcoded default.
 
     Must be called BEFORE `from agents.graph import modernize` for
-    ESCALATION_MODEL/ESCALATION_THRESHOLD/SANDBOX_RUNTIME specifically —
-    those are read from os.environ once at that import's module-load
-    time, so anything set only here would silently never take effect if
-    this ran after it. LANGSMITH_TRACING/PROJECT/ENDPOINT don't share
-    that constraint (confirmed by reading langchain_core's callback
-    manager: tracing config is resolved fresh on every .invoke() call,
-    not baked in when ChatOllama is constructed) but are applied here
-    too, for one consistent place to reason about configuration."""
+    ESCALATION_MODEL/ESCALATION_THRESHOLD/REVIEWER_MODEL/SANDBOX_RUNTIME
+    specifically — those are read from os.environ once at that import's
+    module-load time, so anything set only here would silently never
+    take effect if this ran after it. LANGSMITH_TRACING/PROJECT/ENDPOINT
+    don't share that constraint (confirmed by reading langchain_core's
+    callback manager: tracing config is resolved fresh on every
+    .invoke() call, not baked in when ChatOllama is constructed) but are
+    applied here too, for one consistent place to reason about
+    configuration."""
     escalation = config.get("escalation", {})
     if "model" in escalation:
         os.environ.setdefault("ESCALATION_MODEL", str(escalation["model"]))
     if "threshold" in escalation:
         os.environ.setdefault("ESCALATION_THRESHOLD", str(escalation["threshold"]))
+    if "reviewer_model" in escalation:
+        os.environ.setdefault("REVIEWER_MODEL", str(escalation["reviewer_model"]))
 
     github = config.get("github", {})
     if "repo" in github:

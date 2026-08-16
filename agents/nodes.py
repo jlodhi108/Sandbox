@@ -8,6 +8,17 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from agents.state import AgentState
 from sandbox.verifier import verify, run_semgrep
 from languages import get_handler_by_name
+from llm_budget import LLMBudget
+
+# Default ceiling for THIS process's lifetime, from MAX_LLM_CALLS_PER_RUN
+# if set (parity with every other env-var-configurable setting in this
+# module). main.py's __main__ block and mcp_server.py's tool functions
+# both call llm_budget.reset(max_calls=...) with the config-resolved
+# value at the start of each actual run, so this import-time default
+# only matters for callers that skip that step (e.g. calling agents.graph
+# directly, as the test suite does).
+MAX_LLM_CALLS_PER_RUN = os.environ.get("MAX_LLM_CALLS_PER_RUN")
+llm_budget = LLMBudget(max_calls=int(MAX_LLM_CALLS_PER_RUN) if MAX_LLM_CALLS_PER_RUN else None)
 
 llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0)
 
@@ -21,6 +32,17 @@ llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0)
 ESCALATION_MODEL = os.environ.get("ESCALATION_MODEL")
 ESCALATION_THRESHOLD = int(os.environ.get("ESCALATION_THRESHOLD", "3"))
 escalation_llm = ChatOllama(model=ESCALATION_MODEL, temperature=0) if ESCALATION_MODEL else None
+
+# Optional dedicated model for assess_risk()'s self-critique step. Research
+# on adversarial/verifier-pattern code review is explicit that a model
+# reviewing its own output is a weak checker — it measurably favors its
+# own generative patterns regardless of how capable it is, which is a
+# different axis than "is this model smart enough" (what ESCALATION_MODEL
+# targets). See _select_reviewer_llm for how this combines with
+# escalation_llm to get a genuinely different model for free when one is
+# already configured, with zero new setup required.
+REVIEWER_MODEL = os.environ.get("REVIEWER_MODEL")
+reviewer_llm = ChatOllama(model=REVIEWER_MODEL, temperature=0) if REVIEWER_MODEL else None
 
 # Execution-grounded best-of-N: on the FIRST (blind, no error feedback)
 # attempt only, generate this many independent candidates and let
@@ -49,11 +71,23 @@ def _invoke_llm_with_retry(llm_instance, messages):
     we've seen it die mid-run (e.g. the machine slept, or it crashed) and
     take the whole main.py run down with a raw ConnectionError. Retry a
     few times with a short delay before giving up, so one transient blip
-    doesn't waste an otherwise-successful multi-chunk run."""
+    doesn't waste an otherwise-successful multi-chunk run.
+
+    This is the single chokepoint every LLM call in this codebase passes
+    through (refactor, fix, risk assessment, probe generation) — the
+    right, and only, place to enforce a call budget and count usage,
+    rather than instrumenting every call site separately. check() raises
+    BEFORE making a new call if the run is already at/over budget;
+    record() runs after a successful call, using response.usage_metadata
+    (confirmed present on ChatOllama responses: input_tokens/output_tokens/
+    total_tokens) when the backend provides it."""
+    llm_budget.check()
     last_error = None
     for attempt in range(_LLM_RETRY_ATTEMPTS):
         try:
-            return llm_instance.invoke(messages)
+            response = llm_instance.invoke(messages)
+            llm_budget.record(getattr(llm_instance, "model", "unknown"), getattr(response, "usage_metadata", None))
+            return response
         except (httpx.ConnectError, httpx.ReadTimeout) as e:
             last_error = e
             if attempt < _LLM_RETRY_ATTEMPTS - 1:
@@ -473,21 +507,44 @@ its inputs, with no side effects and nothing that could vary between runs."""
 _RISK_RE = re.compile(r"RISK:\s*(yes|no)", re.IGNORECASE)
 
 
-def assess_risk(modernized_code: str) -> tuple[bool, str]:
+def _select_reviewer_llm(used_escalation: bool):
+    """Pick a model for assess_risk() that, wherever possible, is NOT the
+    same one that wrote the code being reviewed — a model grading its own
+    output is a measurably weak checker (it favors its own generative
+    patterns), independent of how strong that model is. Preference order:
+    1. REVIEWER_MODEL, if explicitly configured — always wins, since it's
+       an explicit request for a specific reviewer.
+    2. Otherwise, reuse whichever of {base llm, escalation_llm} did NOT
+       write this candidate, when escalation_llm is configured at all —
+       genuinely different weights, zero new setup for anyone who already
+       set ESCALATION_MODEL.
+    3. Otherwise (no escalation_llm configured, no REVIEWER_MODEL), fall
+       back to the base model — the only one available. Same as this
+       project's original behavior; nothing regresses for a zero-config
+       user."""
+    if reviewer_llm is not None:
+        return reviewer_llm
+    if escalation_llm is not None:
+        return llm if used_escalation else escalation_llm
+    return llm
+
+
+def assess_risk(modernized_code: str, used_escalation: bool = False) -> tuple[bool, str]:
     """One extra LLM call, made only after a chunk has already passed
     structural validation, sandbox compile/run, AND the stdout-equivalence
     check. Those checks prove "this specific run behaved the same" — they
     can't prove "this function can never behave differently," which matters
-    for anything with side effects or non-determinism. Always uses the
-    base model regardless of escalation state: this is a cheap self-critique
-    prompt, not a task that benefits from a stronger model, and running it
-    on the escalation model would just double the cost of already-escalated
-    chunks for no real benefit."""
+    for anything with side effects or non-determinism. Reviewed by a
+    DIFFERENT model than whichever one wrote modernized_code wherever
+    possible (see _select_reviewer_llm) — self-review is a known weak
+    checker regardless of model strength, which is a separate concern
+    from escalating to a stronger model for difficulty alone."""
+    reviewer = _select_reviewer_llm(used_escalation)
     messages = [
         SystemMessage(content=_RISK_SYSTEM_PROMPT),
         HumanMessage(content=modernized_code),
     ]
-    response = _invoke_llm_with_retry(llm, messages)
+    response = _invoke_llm_with_retry(reviewer, messages)
     text = response.content.strip()
     match = _RISK_RE.search(text)
     risk_flag = bool(match) and match.group(1).lower() == "yes"
@@ -520,6 +577,94 @@ def scan_security(language: str, modernized_code: str) -> tuple[bool, list[dict]
     if result["status"] != "success":
         return False, []
     return bool(result["findings"]), result["findings"]
+
+
+_MUTATION_SYSTEM_PROMPT = """You will be given ONE function that a human
+reviewer trusts is correct. Produce a SUBTLY modified version that
+introduces exactly one realistic bug — the kind a careless refactor
+might introduce — while staying syntactically valid and superficially
+plausible.
+
+Good mutations (pick ONE): flip a comparison operator (== vs !=, < vs
+<=, > vs >=); swap + for - or * for /; off-by-one a loop bound, index,
+or numeric literal; negate a boolean condition; use the wrong variable
+in one place where a similarly-named one exists; drop or duplicate one
+statement.
+
+Do NOT change the function's name, parameters, or overall structure —
+only introduce the one subtle behavioral bug, somewhere it would
+plausibly slip past a quick read.
+
+Respond with ONLY the mutated function. No markdown fences, no
+commentary, no explanation, no diff — just the complete rewritten
+function body."""
+
+
+def generate_mutant(language: str, function_code: str) -> tuple[str, list[str]] | None:
+    """Ask the model for a deliberately, subtly wrong variant of code
+    that already passed every check. Returns (mutant_code,
+    required_imports) — required_imports uses the same REQUIRES-marker
+    convention as refactorer_node's output, extracted the same way, in
+    case the mutation happens to need one (unlikely given the prompt,
+    but handled for correctness rather than assumed away). Returns None
+    if the model can't/won't produce a plausible, DIFFERENT mutant —
+    callers must treat that as "no mutant available to test with," not
+    an error, same contract as generate_probes returning []."""
+    messages = [
+        SystemMessage(content=_MUTATION_SYSTEM_PROMPT),
+        HumanMessage(content=function_code),
+    ]
+    response = _invoke_llm_with_retry(llm, messages)
+    fenced = _strip_markdown_fence(response.content)
+    mutant_code, required_imports = _extract_required_imports(fenced)
+    mutant_code = mutant_code.strip()
+    if not mutant_code or mutant_code == function_code.strip():
+        return None
+    return mutant_code, required_imports
+
+
+def check_mutation_confidence(
+    handler, state: AgentState, modernized_code: str, required_imports: list[str]
+) -> tuple[bool, str]:
+    """Deliberately mutate the ALREADY-VERIFIED modernized_code and run
+    the mutant through the EXACT same verification (_verify_candidate —
+    structural validation, sandbox compile/run, baseline comparison,
+    every probe, determinism recheck) that modernized_code itself just
+    passed. If the mutant ALSO passes, that's a signal about the
+    STRENGTH of THIS chunk's specific checks, not about modernized_code
+    — a version we KNOW is behaviorally broken slipped past baseline/
+    probe comparison, meaning "success" here deserves less confidence
+    than usual (too few probes, or probes that don't happen to exercise
+    the mutated code path). This is the "verify your own verification"
+    counterpart to check_requires_resolvable and the probe/determinism
+    checks already in _verify_candidate — same spirit as classic
+    mutation testing (deliberately break the code, confirm your checks
+    catch it), adapted to a run that generates its own checks on the
+    fly instead of reusing a pre-existing test suite.
+
+    Post-success only: no point spending an extra LLM call + sandbox
+    round-trip mutating a chunk that was already rejected. Flags,
+    doesn't block — mirrors assess_risk/scan_security's design: a
+    failed mutation check says "trust this result a bit less," never
+    "discard a result that already passed rigorous verification.\""""
+    mutant = generate_mutant(state["language"], modernized_code)
+    if mutant is None:
+        return False, ""
+    mutant_code, mutant_imports = mutant
+    merged_imports = list(required_imports)
+    for m in mutant_imports:
+        if m not in merged_imports:
+            merged_imports.append(m)
+
+    result = _verify_candidate(handler, state, mutant_code, merged_imports)
+    if result["status"] == "success":
+        return True, (
+            "A deliberately broken variant of this function passed the "
+            "same verification (baseline/probe checks) that the real "
+            "modernization did — this chunk's specific checks may not "
+            "have enough coverage to catch a subtle regression here."
+        )
+    return False, ""
 
 
 def fallback_node(state: AgentState) -> AgentState:

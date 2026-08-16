@@ -18,6 +18,41 @@ _client = None
 # supported way to add a runtime to it at all.
 SANDBOX_RUNTIME = os.environ.get("SANDBOX_RUNTIME") or None
 
+# Custom seccomp profile, ON by default — unlike SANDBOX_RUNTIME, this
+# needs NO host-level setup (it's a plain JSON file shipped in this repo)
+# and works identically on Linux and macOS Docker Desktop, so it closes
+# the "gVisor is a Linux-only no-op" hardening gap for local dev without
+# asking anyone to configure anything. Derived from Docker's own
+# default seccomp profile (moby/profiles, fetched 2026-08) with ONE
+# change: the unconditional allow for ptrace/process_vm_readv/
+# process_vm_writev (gated only by kernel version, not by capability,
+# in Docker's stock profile) is removed entirely, falling through to
+# the profile's defaultAction (SCMP_ACT_ERRNO — deny). This sandbox
+# only ever compiles/runs small, known programs across 6 language
+# toolchains — none of them have any legitimate reason to inspect or
+# attach to another process's memory, which is exactly what those 3
+# syscalls are for and exactly the kind of capability a container-escape
+# or info-leak technique would want. Verified against all 6 toolchains
+# (g++, python3, node, tsc, javac/java, php) before being trusted here —
+# see sandbox/verifier.py's __main__ self-test, which both the CI
+# "sandbox-smoke-test" job and this comment's author ran directly.
+# Everything else Docker's default profile already allows/blocks is left
+# completely untouched, deliberately: that profile is mature and
+# carefully tuned (e.g. per-argument filtering on `personality`,
+# capability-gating an entire second tier of syscalls like mount/
+# unshare/setns), and hand-rewriting more of it from scratch risks
+# subtly breaking one of the 6 toolchains in a way that would look like
+# a confusing compiler bug rather than a clear security-config error.
+#
+# Set DISABLE_SECCOMP_PROFILE=1 to fall back to Docker's own unmodified
+# default profile (e.g. if a future toolchain genuinely needs one of the
+# 3 removed syscalls — unlikely, but this is the escape hatch).
+_SECCOMP_PROFILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seccomp-profile.json")
+_seccomp_profile_json = None
+if not os.environ.get("DISABLE_SECCOMP_PROFILE"):
+    with open(_SECCOMP_PROFILE_PATH) as _f:
+        _seccomp_profile_json = _f.read()
+
 
 def _get_client():
     # Lazy so importing this module doesn't require a running Docker
@@ -26,6 +61,12 @@ def _get_client():
     if _client is None:
         _client = docker.from_env()
     return _client
+
+
+def _security_opt() -> list[str] | None:
+    if _seccomp_profile_json is None:
+        return None
+    return [f"seccomp={_seccomp_profile_json}"]
 
 
 def verify(
@@ -77,6 +118,9 @@ def verify(
             )
             if SANDBOX_RUNTIME:
                 run_kwargs["runtime"] = SANDBOX_RUNTIME
+            security_opt = _security_opt()
+            if security_opt:
+                run_kwargs["security_opt"] = security_opt
             container = client.containers.run(**run_kwargs)
 
             try:
@@ -149,6 +193,9 @@ def run_semgrep(source_code: str, filename: str, timeout: int = 15, image: str =
             )
             if SANDBOX_RUNTIME:
                 run_kwargs["runtime"] = SANDBOX_RUNTIME
+            security_opt = _security_opt()
+            if security_opt:
+                run_kwargs["security_opt"] = security_opt
             container = client.containers.run(**run_kwargs)
             try:
                 container.wait(timeout=timeout)
@@ -204,6 +251,23 @@ if __name__ == "__main__":
         print(f"FAILED toolchains: {failures}")
         sys.exit(1)
     print("All toolchains OK")
+
+    if _seccomp_profile_json is not None:
+        # Positive confirmation the hardened profile is actually ACTIVE
+        # (not just that nothing broke) — ptrace must now be blocked,
+        # where Docker's stock default profile allows it unconditionally.
+        ptrace_probe = (
+            "import ctypes, ctypes.util\n"
+            "libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)\n"
+            "result = libc.ptrace(0, 0, None, None)\n"
+            "print('BLOCKED' if result == -1 and ctypes.get_errno() != 0 else 'ALLOWED')\n"
+        )
+        ptrace_result = verify(ptrace_probe, "main.py", "python3 main.py")
+        print(f"ptrace probe: {ptrace_result}")
+        if "BLOCKED" not in ptrace_result.get("stdout", ""):
+            print("FAILED: seccomp profile did not block ptrace as expected")
+            sys.exit(1)
+        print("Seccomp hardening OK (ptrace blocked)")
 
     semgrep_result = run_semgrep('import os\ndef f(cmd):\n    os.system(cmd)\n', "main.py")
     print(f"semgrep: {semgrep_result}")

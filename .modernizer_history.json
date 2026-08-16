@@ -1,7 +1,7 @@
 {
   "python": {
-    "chunks_succeeded": 2,
-    "chunks_attempted": 2
+    "chunks_succeeded": 9,
+    "chunks_attempted": 11
   },
   "cpp": {
     "chunks_succeeded": 2,
@@ -10,5 +10,9 @@
   "java": {
     "chunks_succeeded": 2,
     "chunks_attempted": 3
+  },
+  "javascript": {
+    "chunks_succeeded": 2,
+    "chunks_attempted": 2
   }
 }
