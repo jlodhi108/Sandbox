@@ -609,7 +609,8 @@ def test_run_file_characterize_off_by_default():
             "risk_flag": False, "security_flag": False, "mutation_confidence_flag": False,
             "compiler_stderr": "",
         }
-        with patch("main.modernize", return_value=fake_state):
+        with patch("main.modernize", return_value=fake_state), \
+             patch("main.verify", return_value={"status": "success", "stdout": "Bob\n", "stderr": "", "exit_code": 0}):
             stats = main.run_file(file_path, open_pr=False, max_iterations=5)
 
     assert stats["characterization_test_path"] is None
