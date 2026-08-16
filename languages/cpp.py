@@ -19,6 +19,10 @@ class CppHandler(LanguageHandler):
     sandbox_filename = "main.cpp"
     ts_language = Language(tscpp.language())
     query_src = "(function_definition) @function"
+    type_definition_query_src = """
+(class_specifier name: (type_identifier) @name) @def
+(struct_specifier name: (type_identifier) @name) @def
+"""
 
     def chunk(self, source: bytes) -> list[CodeChunk]:
         # Delegate to the original, independently-tested chunker rather

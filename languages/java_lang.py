@@ -15,6 +15,10 @@ class JavaHandler(LanguageHandler):
     # the enclosing class_declaration untouched (same overlap-avoidance
     # reasoning as every other handler).
     query_src = "(method_declaration) @function"
+    type_definition_query_src = """
+(class_declaration name: (identifier) @name) @def
+(interface_declaration name: (identifier) @name) @def
+"""
 
     def run_command(self) -> str:
         return "javac Main.java && java Main"

@@ -9,6 +9,8 @@ from agents.state import AgentState
 from sandbox.verifier import verify, run_semgrep
 from languages import get_handler_by_name
 from llm_budget import LLMBudget
+import deterministic_rules
+import property_testing
 
 # Default ceiling for THIS process's lifetime, from MAX_LLM_CALLS_PER_RUN
 # if set (parity with every other env-var-configurable setting in this
@@ -260,20 +262,88 @@ def _with_recipe(system_prompt: str, recipe_instruction: str | None) -> str:
     )
 
 
+def _format_context_block(context_signatures: list[str] | None) -> str:
+    """Formats the sibling/codebase signature context (see
+    agents/graph.py:_extract_context_signatures) into a prompt section,
+    or '' if there's none to show. Grounds the model in what the
+    codebase ACTUALLY has — real function/type names it can reference
+    with confidence — instead of guessing, the same hallucination gap
+    static-analysis-first approaches (AlphaTrans, LegacyTranslate) exist
+    to close, scoped down to what a same-language, function-level
+    pipeline actually needs: a short list of real signatures already
+    extracted via tree-sitter chunking, not a full cross-language
+    project skeleton (this project modernizes Python-to-Python,
+    JS-to-JS, etc. — there's no cross-language type-resolution problem
+    to solve here)."""
+    if not context_signatures:
+        return ""
+    listed = "\n".join(f"- {s}" for s in context_signatures)
+    return (
+        "For reference, other functions/types already defined elsewhere in this "
+        "codebase (do not redefine them; only call one if you're confident about "
+        "its exact signature and behavior):\n"
+        f"{listed}\n\n"
+    )
+
+
+def _format_type_definitions_block(referenced_type_definitions: list[str] | None) -> str:
+    """Formats the FULL source of every class/struct/interface this
+    chunk references (see agents/graph.py:
+    _extract_referenced_type_definitions) into a prompt section, or ''
+    if there's none. Deeper grounding than _format_context_block's
+    one-line names: the model sees the type's actual fields/methods, so
+    it can apply type hints or construct/use the type correctly instead
+    of guessing at its shape."""
+    if not referenced_type_definitions:
+        return ""
+    joined = "\n\n".join(referenced_type_definitions)
+    return (
+        "Full definitions of type(s) this function references, so you know their "
+        "exact shape (do not redefine them):\n"
+        f"{joined}\n\n"
+    )
+
+
 def refactorer_node(state: AgentState) -> AgentState:
     handler = get_handler_by_name(state["language"])
     recipe_instruction = state.get("recipe_instruction")
+    context_block = (
+        _format_type_definitions_block(state.get("referenced_type_definitions"))
+        + _format_context_block(state.get("context_signatures"))
+    )
+
+    if state["iteration_count"] == 0:
+        # Try a deterministic (non-LLM) rewrite FIRST, before spending any
+        # LLM call at all — see deterministic_rules.py's module docstring
+        # for exactly what makes a rule eligible (provably behavior-
+        # preserving by construction, not a heuristic). This candidate
+        # still goes through the EXACT SAME verification pipeline as an
+        # LLM-generated one (verifier_node doesn't know or care where a
+        # candidate came from) — this only ever skips the LLM call, never
+        # a safety check. If it fails verification, the next iteration
+        # falls through to the normal LLM path below with real error
+        # feedback, same as any other failed attempt.
+        deterministic_code = deterministic_rules.try_apply(state["language"], state["original_code"])
+        if deterministic_code is not None:
+            return {
+                **state,
+                "candidate_codes": [{"code": deterministic_code, "required_imports": []}],
+                "modernized_code": deterministic_code,
+                "required_imports": [],
+                "used_deterministic_rule": True,
+            }
 
     if state["iteration_count"] == 0:
         messages = [
             SystemMessage(content=_with_recipe(handler.refactor_system_prompt, recipe_instruction)),
-            HumanMessage(content=state["original_code"]),
+            HumanMessage(content=f"{context_block}{state['original_code']}"),
         ]
     else:
         messages = [
             SystemMessage(content=_with_recipe(handler.fix_system_prompt, recipe_instruction)),
             HumanMessage(
                 content=(
+                    f"{context_block}"
                     f"Previous attempt:\n{state['modernized_code']}\n\n"
                     f"Compiler/runtime error:\n{state['compiler_stderr']}\n\n"
                     f"Original legacy code (for reference):\n{state['original_code']}"
@@ -316,6 +386,11 @@ def refactorer_node(state: AgentState) -> AgentState:
         "modernized_code": candidates[0]["code"],
         "required_imports": candidates[0]["required_imports"],
         "used_escalation": used_escalation or state.get("used_escalation", False),
+        # Explicitly False here (not left as whatever a PRIOR failed
+        # iteration set it to) — this attempt's winning candidate, if
+        # any, is LLM-generated, not the deterministic rule's, even if
+        # iteration 0 tried the deterministic path first and it failed.
+        "used_deterministic_rule": False,
     }
 
 
@@ -483,6 +558,81 @@ def _verify_candidate(handler, state: AgentState, code: str, required_imports: l
                         ),
                     }
 
+    # Adversarial counterexample search: ask the model to actively try to
+    # find an input where the ORIGINAL and this CANDIDATE diverge, given
+    # both versions — a sharper tool than the probes above, which only
+    # ever saw the original and picked examples without knowing what the
+    # modernization actually changed. Runs once, after every other check
+    # already passed (no point spending an extra LLM call + two sandbox
+    # round-trips on a candidate about to be rejected anyway), and only
+    # for languages where appending a probe is safe (same gate
+    # _capture_function_probes uses — see LanguageHandler.
+    # supports_function_probe for why cpp/java are excluded).
+    if result["status"] == "success" and handler.supports_function_probe:
+        adversarial_snippet = generate_adversarial_probe(state["language"], state["original_code"], code)
+        if adversarial_snippet is not None:
+            original_probe = state["full_source"] + b"\n" + adversarial_snippet.encode("utf-8") + b"\n"
+            original_result = verify(
+                original_probe.decode("utf-8"), filename=handler.sandbox_filename, run_cmd=handler.run_command(),
+            )
+            if original_result["status"] == "success":
+                # Only meaningful if the ORIGINAL actually ran cleanly
+                # with this input — if the model's own counterexample
+                # doesn't even run against the original (bad guess, or a
+                # local-variable-only reference like the probe-capture
+                # path already guards against), there's no baseline to
+                # compare the candidate against, so this check is
+                # skipped rather than treated as a pass OR a failure.
+                candidate_probe = candidate_file + b"\n" + adversarial_snippet.encode("utf-8") + b"\n"
+                candidate_result = verify(
+                    candidate_probe.decode("utf-8"), filename=handler.sandbox_filename, run_cmd=handler.run_command(),
+                )
+                if candidate_result["status"] != "success" or candidate_result["stdout"] != original_result["stdout"]:
+                    return {
+                        "status": "failed",
+                        "compiler_stderr": (
+                            "An adversarially-chosen input (picked by comparing your "
+                            "modernized version against the original) produces a "
+                            "DIFFERENT result on the modernized version than on the "
+                            "original — this is a real behavioral difference, not a "
+                            "false positive.\n\n"
+                            f"Input used: {adversarial_snippet}\n\n"
+                            f"Original produces: {original_result['stdout']!r}\n\n"
+                            f"Modernized produces: "
+                            f"{candidate_result.get('stdout', candidate_result.get('stderr'))!r}\n\n"
+                            "Fix the function so it produces IDENTICAL results for "
+                            "this input too."
+                        ),
+                    }
+
+    # Property-based equivalence testing (Python only — see
+    # property_testing.py's module docstring for exactly when this
+    # applies): samples across the ENTIRE input space a fully type-
+    # hinted parameter list admits, not just the specific examples the
+    # probes/adversarial-search above happened to try. Complementary,
+    # not redundant — research on testing LLM-generated code found
+    # property-based and example-based approaches each catch a majority
+    # of bugs independently, but MORE together than either alone.
+    if result["status"] == "success" and state["language"] == "python":
+        property_script = property_testing.generate_property_test(state["original_code"], code)
+        if property_script is not None:
+            property_result = verify(
+                property_script, filename="property_test.py", run_cmd="python3 property_test.py",
+            )
+            if property_result["status"] != "success":
+                return {
+                    "status": "failed",
+                    "compiler_stderr": (
+                        "Property-based testing (Hypothesis, sampling across the full "
+                        "input space your type hints admit) found an input where the "
+                        "modernized function disagrees with the original.\n\n"
+                        f"{property_result['stderr']}\n\n"
+                        "Fix the function so it produces IDENTICAL results (including "
+                        "raising the same kind of exception) for every input its type "
+                        "hints allow, not just the specific cases already checked above."
+                    ),
+                }
+
     return {"status": result["status"], "compiler_stderr": result["stderr"]}
 
 
@@ -570,6 +720,63 @@ def _select_reviewer_llm(used_escalation: bool):
     if escalation_llm is not None:
         return llm if used_escalation else escalation_llm
     return llm
+
+
+_PUNT_SYSTEM_PROMPT = """You are about to modernize ONE function. Before
+attempting it, honestly assess whether you're likely to be able to
+rewrite it to modern idioms WITHOUT changing its observable behavior.
+
+Answer with EXACTLY two lines:
+PUNT: yes
+<one short sentence why — what makes this risky or unclear>
+
+or:
+
+PUNT: no
+<one short sentence why — what makes you confident>
+
+Answer PUNT: yes if the function does something you find genuinely
+ambiguous or error-prone to reproduce: relies on subtle implicit
+behavior of the ORIGINAL language/runtime (implicit type coercion,
+undefined-but-relied-upon ordering, a quirky legacy API whose exact
+semantics you're unsure of), mixes several unrelated concerns in a way
+that's hard to modernize piece-by-piece without risking a behavior
+change, or is simply too short/context-free to know what's actually
+"legacy" about it versus already fine as-is.
+
+Answer PUNT: no if you're confident you understand exactly what this
+function does and how to modernize it while preserving that behavior
+exactly — this should be the common case for ordinary, self-contained
+legacy code (e.g. missing type hints, old-style string formatting, var
+instead of let/const, callback style instead of async/await)."""
+
+_PUNT_RE = re.compile(r"PUNT:\s*(yes|no)", re.IGNORECASE)
+
+
+def assess_punt(language: str, original_code: str) -> tuple[bool, str]:
+    """A lightweight, PRE-attempt confidence check — the mirror image of
+    assess_risk (which runs post-success and asks 'was this hard to
+    verify'), this runs BEFORE any rewrite attempt and asks 'am I
+    confident I can do this correctly at all'. Opt-in (see
+    agents/graph.py:modernize's punt_check_enabled) because it costs one
+    extra LLM call per chunk to buy the ability to skip chunks the model
+    itself doubts, saving the (usually larger) cost of a full best-of-N
+    attempt + sandbox verification cycle that was likely to fail anyway.
+
+    Deliberately asks the BASE model (not a reviewer/escalation model,
+    unlike assess_risk) — this is the model's own honest self-assessment
+    of whether IT can do the job, which is a different question than
+    'is a second opinion needed', so self-review concerns don't apply
+    the same way here."""
+    messages = [
+        SystemMessage(content=_PUNT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Language: {language}\n\n{original_code}"),
+    ]
+    response = _invoke_llm_with_retry(llm, messages)
+    text = response.content.strip()
+    match = _PUNT_RE.search(text)
+    punt_flag = bool(match) and match.group(1).lower() == "yes"
+    return punt_flag, text
 
 
 def assess_risk(modernized_code: str, used_escalation: bool = False) -> tuple[bool, str]:
@@ -777,6 +984,57 @@ def generate_probes(language: str, function_code: str, count: int = 3) -> list[s
         return []
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return lines[:count]
+
+
+_ADVERSARIAL_SYSTEM_PROMPT_TEMPLATE = """You will be given TWO versions of
+the same {label} function: the ORIGINAL (legacy) version and a MODERNIZED
+version that is supposed to behave IDENTICALLY for every input. Your job
+is to actively try to DISPROVE that — find ONE input that would make them
+produce different results, if such an input exists.
+
+Think adversarially about what the modernization might have subtly
+changed: type coercion differences, boundary values (empty, zero,
+negative, very large, None/null), order-of-operations changes, off-by-one
+errors, truncation/rounding differences, or a semantic gap between the
+old idiom and the new one used to replace it (e.g. does the new string
+method handle an empty string the same way the old one did?).
+
+Respond with EXACTLY one line: a single call+print statement, using the
+function's exact name, for the input you believe is MOST likely to
+reveal a difference: {print_call}
+
+If you genuinely cannot think of any input that would reveal a
+difference, respond with EXACTLY: PROBE: SKIP"""
+
+
+def generate_adversarial_probe(language: str, original_code: str, modernized_code: str) -> str | None:
+    """Ask the model to actively search for an input that would make the
+    ORIGINAL and MODERNIZED versions diverge — unlike generate_probes
+    (which only sees the original and picks 'diverse' examples) or
+    check_mutation_confidence (which mutates the code, not the input),
+    this sees BOTH versions and is explicitly prompted to find a
+    counterexample, the same framing used in recent program-equivalence
+    research (disprove equivalence by construction, not by sampling).
+    Returns a probe snippet, or None if unsupported for this language or
+    the model couldn't/wouldn't produce one — callers treat None as 'no
+    adversarial check available,' not an error, same contract as
+    generate_probes."""
+    if language not in _PROBE_LANGUAGE_LABELS:
+        return None
+    label, print_call = _PROBE_LANGUAGE_LABELS[language]
+    prompt = _ADVERSARIAL_SYSTEM_PROMPT_TEMPLATE.format(label=label, print_call=print_call)
+    messages = [
+        SystemMessage(content=prompt),
+        HumanMessage(content=f"ORIGINAL:\n{original_code}\n\nMODERNIZED:\n{modernized_code}"),
+    ]
+    response = _invoke_llm_with_retry(llm, messages)
+    text = _strip_markdown_fence(response.content).strip()
+    if not text or "SKIP" in text.upper():
+        return None
+    # Defensive: take only the first non-empty line even if the model
+    # wrote more than the requested single line.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[0] if lines else None
 
 
 _PROBE_WRAPPERS = {

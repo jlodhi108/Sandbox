@@ -142,13 +142,15 @@ def test_verifier_node_injects_missing_import_python():
         "full_source": b"def main():\n    pass\n",
         "chunk_start": 0,
         "chunk_end": 22,
+        "original_code": "def main():\n    pass",
         "modernized_code": "def main():\n    pass",
         "required_imports": ["pathlib"],
         "compiler_stderr": "",
         "iteration_count": 0,
         "status": "pending",
     }
-    with patch("agents.nodes.verify") as mock_verify:
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value=None):
         mock_verify.return_value = {"status": "success", "stderr": "", "exit_code": 0}
         verifier_node(state)
         candidate = mock_verify.call_args[0][0]
@@ -358,6 +360,206 @@ def test_refactorer_node_omits_recipe_section_when_none_configured():
     assert "Additional guidance for this modernization run" not in system_message.content
 
 
+def test_format_context_block_returns_empty_string_when_no_signatures():
+    from agents.nodes import _format_context_block
+
+    assert _format_context_block(None) == ""
+    assert _format_context_block([]) == ""
+
+
+def test_format_context_block_lists_signatures():
+    from agents.nodes import _format_context_block
+
+    block = _format_context_block(["def parse_config(path):", "class ConfigError(Exception):"])
+    assert "def parse_config(path):" in block
+    assert "class ConfigError(Exception):" in block
+    assert "do not redefine" in block
+
+
+def test_refactorer_node_includes_context_signatures_in_human_message():
+    state = {
+        "language": "python",
+        "iteration_count": 0,
+        "original_code": "def f(x):\n    return x + 1\n",
+        "recipe_instruction": None,
+        "context_signatures": ["def parse_config(path):", "def helper(y):"],
+    }
+    mock_response = MagicMock()
+    mock_response.content = "def f(x):\n    return x + 1\n"
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    human_message = mock_llm.invoke.call_args[0][0][1]
+    assert "def parse_config(path):" in human_message.content
+    assert "def helper(y):" in human_message.content
+    assert "def f(x):" in human_message.content  # the actual chunk is still there
+
+
+def test_refactorer_node_includes_context_signatures_in_fix_prompt_on_retry():
+    state = {
+        "language": "python",
+        "iteration_count": 1,
+        "original_code": "def f(x):\n    return x + 1\n",
+        "modernized_code": "def f(x):\n    return x - 1\n",
+        "compiler_stderr": "wrong output",
+        "recipe_instruction": None,
+        "context_signatures": ["def parse_config(path):"],
+    }
+    mock_response = MagicMock()
+    mock_response.content = "def f(x):\n    return x + 1\n"
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes.escalation_llm", None):
+        mock_llm.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    human_message = mock_llm.invoke.call_args[0][0][1]
+    assert "def parse_config(path):" in human_message.content
+
+
+def test_refactorer_node_omits_context_block_when_no_signatures():
+    state = {
+        "language": "python",
+        "iteration_count": 0,
+        "original_code": "def f(x):\n    return x + 1\n",
+        "recipe_instruction": None,
+        "context_signatures": [],
+    }
+    mock_response = MagicMock()
+    mock_response.content = "def f(x):\n    return x + 1\n"
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    human_message = mock_llm.invoke.call_args[0][0][1]
+    assert "already defined elsewhere in this codebase" not in human_message.content
+
+
+def test_format_type_definitions_block_returns_empty_string_when_none():
+    from agents.nodes import _format_type_definitions_block
+
+    assert _format_type_definitions_block(None) == ""
+    assert _format_type_definitions_block([]) == ""
+
+
+def test_format_type_definitions_block_includes_full_definitions():
+    from agents.nodes import _format_type_definitions_block
+
+    block = _format_type_definitions_block(["class ConfigError(Exception):\n    pass"])
+    assert "class ConfigError(Exception):" in block
+    assert "do not redefine" in block
+
+
+def test_refactorer_node_includes_type_definitions_in_human_message():
+    state = {
+        "language": "python",
+        "iteration_count": 0,
+        "original_code": "def load_config(path):\n    raise ConfigError('bad')\n",
+        "recipe_instruction": None,
+        "context_signatures": [],
+        "referenced_type_definitions": ["class ConfigError(Exception):\n    pass"],
+    }
+    mock_response = MagicMock()
+    mock_response.content = state["original_code"]
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    human_message = mock_llm.invoke.call_args[0][0][1]
+    assert "class ConfigError(Exception):" in human_message.content
+    assert "def load_config(path):" in human_message.content
+
+
+def test_refactorer_node_omits_type_definitions_block_when_none():
+    state = {
+        "language": "python",
+        "iteration_count": 0,
+        "original_code": "def f(x):\n    return x + 1\n",
+        "recipe_instruction": None,
+        "context_signatures": [],
+        "referenced_type_definitions": [],
+    }
+    mock_response = MagicMock()
+    mock_response.content = "def f(x):\n    return x + 1\n"
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    human_message = mock_llm.invoke.call_args[0][0][1]
+    assert "Full definitions of type" not in human_message.content
+
+
+def test_refactorer_node_uses_deterministic_rule_without_calling_llm():
+    state = {
+        "language": "javascript",
+        "iteration_count": 0,
+        "original_code": "function f() {\n  var x = 1;\n  return x + 1;\n}",
+        "recipe_instruction": None,
+    }
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        result = refactorer_node(state)
+
+    mock_llm.invoke.assert_not_called()
+    mock_diversity.invoke.assert_not_called()
+    assert result["used_deterministic_rule"] is True
+    assert "const x = 1;" in result["modernized_code"]
+    assert result["candidate_codes"] == [{"code": result["modernized_code"], "required_imports": []}]
+
+
+def test_refactorer_node_falls_back_to_llm_when_no_deterministic_rule_applies():
+    state = {
+        "language": "python",
+        "iteration_count": 0,
+        "original_code": "def f(x):\n    return x + 1\n",
+        "recipe_instruction": None,
+    }
+    mock_response = MagicMock()
+    mock_response.content = "def f(x):\n    return x + 1\n"
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        result = refactorer_node(state)
+
+    mock_llm.invoke.assert_called()
+    assert result["used_deterministic_rule"] is False
+
+
+def test_refactorer_node_retry_after_failed_deterministic_candidate_uses_llm_and_marks_it():
+    # iteration_count > 0 means the deterministic candidate from
+    # iteration 0 already failed verification — the retry must go
+    # through the normal LLM fix-prompt path AND correctly report
+    # used_deterministic_rule=False for THIS (winning, LLM) attempt,
+    # not leak True from the earlier failed deterministic attempt.
+    state = {
+        "language": "javascript",
+        "iteration_count": 1,
+        "original_code": "function f() {\n  var x = 1;\n  return x + 1;\n}",
+        "modernized_code": "const x = 1;\nreturn x + 1;",
+        "compiler_stderr": "some error",
+        "recipe_instruction": None,
+        "used_deterministic_rule": True,  # leftover from the failed iteration 0 attempt
+    }
+    mock_response = MagicMock()
+    mock_response.content = "function f() {\n  const x = 1;\n  return x + 1;\n}"
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        result = refactorer_node(state)
+
+    mock_llm.invoke.assert_called()
+    assert result["used_deterministic_rule"] is False
+
+
 def test_invoke_llm_with_retry_recovers_from_transient_failure():
     import httpx
 
@@ -459,6 +661,62 @@ def test_assess_risk_defaults_to_not_flagged_on_unparseable_response():
         assert risk_flag is False
 
 
+def test_assess_punt_parses_yes():
+    from agents.nodes import assess_punt
+
+    mock_response = MagicMock()
+    mock_response.content = "PUNT: yes\nRelies on undocumented legacy quirks I'm unsure about."
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        punt_flag, reason = assess_punt("python", "def f(x):\n    return weird_legacy_thing(x)")
+        assert punt_flag is True
+        assert "legacy quirks" in reason
+
+
+def test_assess_punt_parses_no():
+    from agents.nodes import assess_punt
+
+    mock_response = MagicMock()
+    mock_response.content = "PUNT: no\nStraightforward, confident I can modernize this."
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        punt_flag, reason = assess_punt("python", "def add(a, b):\n    return a + b")
+        assert punt_flag is False
+        assert "Straightforward" in reason
+
+
+def test_assess_punt_defaults_to_not_punted_on_unparseable_response():
+    # Same fail-safe philosophy as assess_risk: an unparseable response
+    # must not block the pipeline — default to attempting the chunk
+    # normally rather than silently skipping it.
+    from agents.nodes import assess_punt
+
+    mock_response = MagicMock()
+    mock_response.content = "unsure what to say here"
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        punt_flag, _ = assess_punt("python", "def add(a, b):\n    return a + b")
+        assert punt_flag is False
+
+
+def test_assess_punt_uses_base_model_not_reviewer_or_escalation():
+    # Deliberately the model's OWN self-assessment of whether IT can do
+    # the job — unlike assess_risk, this should NOT route to a reviewer/
+    # escalation model even if one is configured.
+    from agents.nodes import assess_punt
+
+    mock_response = MagicMock()
+    mock_response.content = "PUNT: no\nfine"
+    with patch("agents.nodes.llm") as mock_llm, \
+         patch("agents.nodes.reviewer_llm") as mock_reviewer, \
+         patch("agents.nodes.escalation_llm") as mock_escalation:
+        mock_llm.invoke.return_value = mock_response
+        assess_punt("python", "def add(a, b):\n    return a + b")
+        mock_llm.invoke.assert_called_once()
+        mock_reviewer.invoke.assert_not_called()
+        mock_escalation.invoke.assert_not_called()
+
+
 def test_select_reviewer_llm_prefers_explicit_reviewer_model():
     from agents.nodes import _select_reviewer_llm
 
@@ -535,6 +793,56 @@ def test_generate_probes_returns_empty_list_on_skip():
         assert probes == []
 
 
+def test_generate_adversarial_probe_returns_snippet():
+    from agents.nodes import generate_adversarial_probe
+
+    mock_response = MagicMock()
+    mock_response.content = "print(add(-1, 1))"
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        snippet = generate_adversarial_probe(
+            "python", "def add(a, b):\n    return a + b",
+            "def add(a: int, b: int) -> int:\n    return a + b",
+        )
+        assert snippet == "print(add(-1, 1))"
+        # Both versions must be in the prompt sent to the model — it
+        # can't find a divergence between them without seeing both.
+        sent_content = mock_llm.invoke.call_args[0][0][1].content
+        assert "def add(a, b):" in sent_content
+        assert "def add(a: int, b: int) -> int:" in sent_content
+
+
+def test_generate_adversarial_probe_returns_none_on_skip():
+    from agents.nodes import generate_adversarial_probe
+
+    mock_response = MagicMock()
+    mock_response.content = "PROBE: SKIP"
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        snippet = generate_adversarial_probe("python", "def add(a, b):\n    return a + b", "def add(a, b):\n    return a + b")
+        assert snippet is None
+
+
+def test_generate_adversarial_probe_takes_only_first_line():
+    from agents.nodes import generate_adversarial_probe
+
+    mock_response = MagicMock()
+    mock_response.content = "print(add(-1, 1))\nsome extra commentary the model wasn't supposed to add"
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        snippet = generate_adversarial_probe("python", "def add(a, b):\n    return a + b", "def add(a, b):\n    return a + b")
+        assert snippet == "print(add(-1, 1))"
+
+
+def test_generate_adversarial_probe_returns_none_for_unsupported_language():
+    from agents.nodes import generate_adversarial_probe
+
+    with patch("agents.nodes.llm") as mock_llm:
+        snippet = generate_adversarial_probe("cpp", "int add(int a, int b) { return a + b; }", "int add(int a, int b) { return a + b; }")
+        assert snippet is None
+        mock_llm.invoke.assert_not_called()
+
+
 def test_wrap_call_as_probe_per_language():
     from agents.nodes import wrap_call_as_probe
 
@@ -578,6 +886,7 @@ def test_verifier_node_accepts_matching_probe_output():
         "full_source": b"def add(a, b):\n    return a + b\n",
         "chunk_start": 0,
         "chunk_end": 32,
+        "original_code": "def add(a, b):\n    return a + b",
         "modernized_code": "def add(a, b):\n    return a + b",
         "required_imports": [],
         "baseline_stdout": None,
@@ -586,7 +895,8 @@ def test_verifier_node_accepts_matching_probe_output():
         "iteration_count": 0,
         "status": "pending",
     }
-    with patch("agents.nodes.verify") as mock_verify:
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value=None):
         # whole-file check, probe check, THEN the determinism re-check
         # (same probe run again) — all three must be consumed
         mock_verify.side_effect = [
@@ -651,6 +961,242 @@ def test_verifier_node_rejects_nondeterministic_output():
         result = verifier_node(state)
         assert result["status"] == "failed"
         assert "non-deterministic" in result["compiler_stderr"]
+
+
+def test_verifier_node_rejects_candidate_on_adversarial_divergence():
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "original_code": "def add(a, b):\n    return a + b",
+        "modernized_code": "def add(a, b):\n    return a + b",  # pretend this is subtly wrong
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value="print(add(-1, 1))"):
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},   # whole-file check
+            {"status": "success", "stderr": "", "stdout": "0\n", "exit_code": 0},  # adversarial probe vs ORIGINAL
+            {"status": "success", "stderr": "", "stdout": "DIFFERENT\n", "exit_code": 0},  # vs CANDIDATE — diverges
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "failed"
+        assert "adversarially-chosen input" in result["compiler_stderr"]
+        assert "print(add(-1, 1))" in result["compiler_stderr"]
+
+
+def test_verifier_node_accepts_candidate_when_adversarial_probe_agrees():
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "original_code": "def add(a, b):\n    return a + b",
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value="print(add(-1, 1))"):
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},   # whole-file check
+            {"status": "success", "stderr": "", "stdout": "0\n", "exit_code": 0},  # vs ORIGINAL
+            {"status": "success", "stderr": "", "stdout": "0\n", "exit_code": 0},  # vs CANDIDATE — matches
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "success"
+
+
+def test_verifier_node_skips_adversarial_check_when_no_snippet_produced():
+    # generate_adversarial_probe returning None (model couldn't/wouldn't
+    # find a counterexample) must not block an otherwise-successful
+    # candidate — same "no opinion" contract as every other probe path.
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "original_code": "def add(a, b):\n    return a + b",
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value=None) as mock_gen:
+        mock_verify.return_value = {"status": "success", "stderr": "", "stdout": "", "exit_code": 0}
+        result = verifier_node(state)
+        assert result["status"] == "success"
+        mock_gen.assert_called_once()
+        assert mock_verify.call_count == 1  # only the whole-file check — no probe round-trips
+
+
+def test_verifier_node_skips_adversarial_check_when_it_cannot_run_against_original():
+    # The model's counterexample failing to even RUN against the
+    # ORIGINAL (bad guess, or references something out of scope) means
+    # there's no baseline to compare against — skip, don't fail.
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "original_code": "def add(a, b):\n    return a + b",
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value="print(add(undefined_name))"):
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},   # whole-file check
+            {"status": "failed", "stderr": "NameError", "stdout": "", "exit_code": 1},  # vs ORIGINAL — doesn't even run
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "success"
+        assert mock_verify.call_count == 2  # never reached the candidate-side check
+
+
+def test_verifier_node_skips_adversarial_check_for_languages_without_function_probes():
+    # cpp doesn't support function probes at all (see LanguageHandler.
+    # supports_function_probe) — the adversarial check must respect the
+    # same gate, never even asking the model for a counterexample.
+    state = {
+        "language": "cpp",
+        "full_source": b"int add(int a, int b) { return a + b; }\n",
+        "chunk_start": 0,
+        "chunk_end": 40,
+        "original_code": "int add(int a, int b) { return a + b; }",
+        "modernized_code": "int add(int a, int b) { return a + b; }",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe") as mock_gen:
+        mock_verify.return_value = {"status": "success", "stderr": "", "stdout": "", "exit_code": 0}
+        result = verifier_node(state)
+        assert result["status"] == "success"
+        mock_gen.assert_not_called()
+
+
+def test_verifier_node_rejects_candidate_on_property_test_failure():
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "original_code": "def add(a: int, b: int) -> int:\n    return a + b",
+        "modernized_code": "def add(a: int, b: int) -> int:\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value=None):
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},   # whole-file check
+            {"status": "failed", "stderr": "AssertionError: divergence with args {'a': 0, 'b': 0}", "stdout": "", "exit_code": 1},  # property test
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "failed"
+        assert "Property-based testing" in result["compiler_stderr"]
+        assert "divergence with args" in result["compiler_stderr"]
+
+
+def test_verifier_node_accepts_candidate_when_property_test_passes():
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "original_code": "def add(a: int, b: int) -> int:\n    return a + b",
+        "modernized_code": "def add(a: int, b: int) -> int:\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value=None):
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},   # whole-file check
+            {"status": "success", "stderr": "", "stdout": "PROPERTY_TEST_OK\n", "exit_code": 0},  # property test
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "success"
+
+
+def test_verifier_node_skips_property_test_when_no_type_hints():
+    # Real code most of this project sees is UNANNOTATED legacy Python —
+    # property_testing.generate_property_test returns None for it, and
+    # that must not block an otherwise-successful candidate or trigger
+    # an extra sandbox round-trip.
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "original_code": "def add(a, b):\n    return a + b",  # no type hints
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probes": [],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value=None):
+        mock_verify.return_value = {"status": "success", "stderr": "", "stdout": "", "exit_code": 0}
+        result = verifier_node(state)
+        assert result["status"] == "success"
+        assert mock_verify.call_count == 1  # only the whole-file check
+
+
+def test_verifier_node_skips_property_test_for_non_python_languages():
+    state = {
+        "language": "cpp",
+        "full_source": b"int add(int a, int b) { return a + b; }\n",
+        "chunk_start": 0,
+        "chunk_end": 40,
+        "original_code": "int add(int a, int b) { return a + b; }",
+        "modernized_code": "int add(int a, int b) { return a + b; }",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.property_testing.generate_property_test") as mock_gen:
+        mock_verify.return_value = {"status": "success", "stderr": "", "stdout": "", "exit_code": 0}
+        result = verifier_node(state)
+        assert result["status"] == "success"
+        mock_gen.assert_not_called()
 
 
 def test_scan_security_flags_when_findings_present():
@@ -748,12 +1294,14 @@ def test_check_mutation_confidence_flags_when_mutant_passes_verification():
         "full_source": b"def add(a, b):\n    return a + b\n",
         "chunk_start": 0,
         "chunk_end": 32,
+        "original_code": "def add(a, b):\n    return a + b",
         "baseline_stdout": None,
         "probes": [],
     }
     mock_mutant_response = MagicMock()
     mock_mutant_response.content = "def add(a, b):\n    return a - b"
-    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes.verify") as mock_verify:
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes.verify") as mock_verify, \
+         patch("agents.nodes.generate_adversarial_probe", return_value=None):
         mock_llm.invoke.return_value = mock_mutant_response
         mock_verify.return_value = {"status": "success", "stderr": "", "stdout": "", "exit_code": 0}
         flag, reason = check_mutation_confidence(

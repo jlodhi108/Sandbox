@@ -51,6 +51,38 @@ class LanguageHandler(ABC):
     name_query_src: str = ""
     call_query_src: str = ""
 
+    # Query matching class/struct/interface DEFINITIONS (name + the full
+    # node), used to ground the refactor prompt in the actual shape of a
+    # type this chunk references (see agents/graph.py:
+    # _extract_referenced_type_definitions) rather than the model
+    # guessing at fields/methods it can't see. Empty string means "not
+    # supported for this language" — the extraction degrades to
+    # returning no type definitions rather than raising, the same
+    # graceful-degradation contract name_query_src/call_query_src use.
+    type_definition_query_src: str = ""
+
+    def extract_type_definitions(self, source: bytes) -> dict[str, tuple[int, int]]:
+        """{type_name: (start_byte, end_byte)} for every class/struct/
+        interface definition in `source`, via type_definition_query_src.
+        Returns {} if this language doesn't define the query. Byte
+        offsets (not extracted text) so callers can slice against
+        whichever exact source bytes they already have in hand."""
+        if not self.type_definition_query_src:
+            return {}
+        parser = Parser(self.ts_language)
+        tree = parser.parse(source)
+        query = Query(self.ts_language, self.type_definition_query_src)
+        results: dict[str, tuple[int, int]] = {}
+        for _pattern_index, match_captures in QueryCursor(query).matches(tree.root_node):
+            name_nodes = match_captures.get("name", [])
+            def_nodes = match_captures.get("def", [])
+            if not name_nodes or not def_nodes:
+                continue
+            name_text = source[name_nodes[0].start_byte:name_nodes[0].end_byte].decode("utf-8")
+            def_node = def_nodes[0]
+            results[name_text] = (def_node.start_byte, def_node.end_byte)
+        return results
+
     def extract_function_name(self, code: str) -> str | None:
         """Pull the name out of a single-function chunk (e.g. "greet" from
         "def greet(name): ..."). Used to search for real call sites of

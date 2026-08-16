@@ -462,3 +462,118 @@ def test_best_of_n_reports_first_candidates_error_when_all_fail():
     # next retry would see candidate0's error specifically — an
     # arbitrary but consistent choice among N failures.
     assert "candidate0 error" in final_state["compiler_stderr"]
+
+
+def test_punt_check_skips_chunk_before_any_attempt():
+    fake_llm = ScriptedLLM(["PUNT: yes\nToo risky, relies on unclear legacy semantics."])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None):
+        final_state = modernize(
+            "cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")),
+            max_iterations=5, punt_check_enabled=True,
+        )
+
+    assert final_state["status"] == "gave_up"
+    assert final_state["punted"] is True
+    assert final_state["iteration_count"] == 0
+    assert "Too risky" in final_state["compiler_stderr"]
+    # The punt check itself is the ONLY LLM call — no refactor attempt,
+    # no risk assessment (post-success only), and NO verify() call at
+    # all (not even baseline capture) since it short-circuits first.
+    assert fake_llm.call_count == 1
+    assert fake_verify.call_count == 0
+
+
+def test_punt_check_disabled_by_default_even_with_a_punt_worthy_response():
+    # punt_check_enabled defaults to False — a model that WOULD punt if
+    # asked must have no effect when the check is simply never run,
+    # confirming this feature is fully opt-in with zero behavior change
+    # otherwise (assess_punt is never called, so its "PUNT: yes" script
+    # entry here is never even reached).
+    fake_llm = ScriptedLLM([
+        "int add(int a, int b) { return a + b; }",  # refactor attempt 1
+        _RISK_NO,                                     # risk assessment
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None):
+        final_state = modernize("cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")), max_iterations=5)
+
+    assert final_state["status"] == "success"
+    assert final_state["punted"] is False
+
+
+def test_punt_check_false_negative_proceeds_to_normal_attempt():
+    fake_llm = ScriptedLLM([
+        "PUNT: no\nConfident about this one.",
+        "int add(int a, int b) { return a + b; }",  # refactor attempt 1
+        _RISK_NO,                                     # risk assessment
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None):
+        final_state = modernize(
+            "cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")),
+            max_iterations=5, punt_check_enabled=True,
+        )
+
+    assert final_state["status"] == "success"
+    assert final_state["punted"] is False
+
+
+def test_context_signatures_populated_and_reach_the_refactor_prompt():
+    multi_fn_source = b"int add(int a, int b) { return a + b; }\nint sub(int a, int b) { return a - b; }\n"
+    fake_llm = ScriptedLLM([
+        "int add(int a, int b) { return a + b; }",  # refactor attempt 1
+        _RISK_NO,                                     # risk assessment
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None):
+        final_state = modernize("cpp", multi_fn_source, 0, len("int add(int a, int b) { return a + b; }"), max_iterations=5)
+
+    assert final_state["status"] == "success"
+    assert final_state["context_signatures"] == ["int sub(int a, int b) { return a - b; }"]
+    refactor_human_message = fake_llm.calls[0][1]
+    assert "int sub(int a, int b) { return a - b; }" in refactor_human_message.content
+
+
+def test_referenced_type_definitions_populated_and_reach_the_refactor_prompt():
+    full_source = (
+        b"class ConfigError(Exception):\n    pass\n\n"
+        b"def load_config(path):\n    raise ConfigError('bad')\n"
+    )
+    fake_llm = ScriptedLLM([
+        "def load_config(path):\n    raise ConfigError('bad')",  # refactor attempt 1
+        _RISK_NO,                                                  # risk assessment
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.graph.generate_probes", return_value=[]), \
+         patch("agents.nodes.escalation_llm", None):
+        chunk_start = full_source.index(b"def load_config")
+        chunk_end = chunk_start + len(b"def load_config(path):\n    raise ConfigError('bad')")
+        final_state = modernize("python", full_source, chunk_start, chunk_end, max_iterations=5)
+
+    assert final_state["status"] == "success"
+    assert len(final_state["referenced_type_definitions"]) == 1
+    assert "class ConfigError(Exception):" in final_state["referenced_type_definitions"][0]
+    # And it actually reached the refactor prompt, not just the state.
+    refactor_human_message = fake_llm.calls[0][1]
+    assert "class ConfigError(Exception):" in refactor_human_message.content

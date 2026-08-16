@@ -118,6 +118,7 @@ class JavaScriptHandler(LanguageHandler):
     call_query_src = _CALL_QUERY_SRC
     ts_language = Language(tsjs.language())
     query_src = _QUERY_SRC
+    type_definition_query_src = "(class_declaration name: (identifier) @name) @def"
 
     def run_command(self) -> str:
         return "node main.js"
@@ -151,6 +152,10 @@ class TypeScriptHandler(LanguageHandler):
     call_query_src = _CALL_QUERY_SRC
     ts_language = Language(tsts.language_typescript())
     query_src = _QUERY_SRC
+    type_definition_query_src = """
+(class_declaration name: (type_identifier) @name) @def
+(interface_declaration name: (type_identifier) @name) @def
+"""
 
     def run_command(self) -> str:
         return "npx tsc main.ts --target ES2020 --module commonjs --outDir out --skipLibCheck && node out/main.js"

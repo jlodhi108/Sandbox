@@ -19,14 +19,23 @@ explanation why.
 - Sandbox/isolation escapes — code executed during chunk verification
   breaking out of the sandbox (see `sandbox/verifier.py`, which supports
   running under gVisor (`runsc`) and applies a custom seccomp profile
-  blocking syscalls like `ptrace`).
+  blocking syscalls like `ptrace`). This includes the property-based
+  testing layer (`property_testing.py`), which `exec()`s original and
+  modernized function source — but always inside this same sandboxed
+  container, never on the host.
 - Path traversal or arbitrary file write/overwrite via the `path` CLI
-  argument or MCP tool arguments.
+  argument or MCP tool arguments — including the newer `--characterize`
+  and `--generate-regression-tests` output paths, and `--isolate-workers`'
+  `git worktree` checkouts (see `git_ops/worktree.py`).
 - Secret leakage — `GITHUB_TOKEN`/`LANGSMITH_API_KEY` (from `.env`) ending
   up in logs, LLM prompts, generated reports, or committed config.
 - Prompt injection in target source code that causes the pipeline to
   exfiltrate secrets, escape the sandbox, or take actions outside the
   intended modernization scope.
+- The GitHub Action (`action.yml`) and any workflow built on it — a
+  workflow granting it `pr: true` needs a `GITHUB_TOKEN` with permission
+  to open pull requests; treat that token with the same care as any other
+  CI secret with write access to the repo.
 
 ## Known limitations (not yet hardened)
 
@@ -38,3 +47,8 @@ explanation why.
   inside a sandbox for verification, but that sandbox is only as strong as
   Docker + the configured isolation layer (gVisor/seccomp) — don't rely on
   it as a hard security boundary against a fully malicious target repo.
+- `--isolate-workers` isolates concurrent workers from each other via
+  `git worktree`, not from a malicious target repo — a worktree shares
+  the same `.git` object store and repo-level git hooks as the real
+  checkout, so it is not a security boundary against a target repo
+  designed to exploit git itself.

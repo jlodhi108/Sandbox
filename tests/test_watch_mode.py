@@ -61,7 +61,8 @@ def test_watch_run_processes_a_file_edited_mid_watch():
         processed = []
 
         def fake_run_file(fp, open_pr, max_iterations, standalone_pr=True, sibling_sources=None,
-                           generate_regression_tests=False, interactive=False, recipe_instruction=None):
+                           generate_regression_tests=False, interactive=False, recipe_instruction=None,
+                           **kwargs):
             processed.append(fp)
             return {"file_path": fp, "chunks_succeeded": 1}
 

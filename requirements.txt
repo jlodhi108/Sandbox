@@ -15,3 +15,9 @@ pydantic>=2.9.0
 python-dotenv>=1.0.0
 pytest>=8.3.0
 fastmcp>=3.0.0  # tested against 3.4.7 — @mcp.tool/Client/instructions= API
+hypothesis>=6.100.0  # host-side: tests/test_property_testing.py execs generated
+                     # scripts directly to verify they're valid. The actual
+                     # RUNTIME use (agents/nodes.py's property-based check) runs
+                     # inside the sandbox container, which installs its own copy
+                     # via sandbox/sandbox-multi.Dockerfile — this entry is for
+                     # local dev/CI testing only, not the sandboxed execution path.

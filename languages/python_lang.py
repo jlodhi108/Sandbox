@@ -25,6 +25,7 @@ class PythonHandler(LanguageHandler):
     # deliberately don't capture class_definition, same reasoning as C++:
     # it would overlap with its own methods and corrupt splicing.
     query_src = "(function_definition) @function"
+    type_definition_query_src = "(class_definition name: (identifier) @name) @def"
 
     def run_command(self) -> str:
         # Python has no separate compile step; running the file is both

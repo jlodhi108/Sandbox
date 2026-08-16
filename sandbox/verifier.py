@@ -314,3 +314,25 @@ if __name__ == "__main__":
         print("FAILED: semgrep did not detect the known-vulnerable sample")
         sys.exit(1)
     print("Semgrep security gate OK")
+
+    # hypothesis must be importable in the sandbox image for
+    # property_testing.py's generated scripts (agents/nodes.py's
+    # property-based equivalence check) to run at all — confirm it's
+    # actually there, and that it can genuinely catch a real divergence,
+    # not just import cleanly.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    import property_testing
+    _divergent_script = property_testing.generate_property_test(
+        "def divide(a: int, b: int) -> int:\n"
+        "    if b == 0:\n"
+        "        raise ValueError('no')\n"
+        "    return a // b",
+        "def divide(a: int, b: int) -> int:\n"
+        "    return a // b",  # dropped the zero-check — a real bug
+    )
+    property_result = verify(_divergent_script, "property_test.py", "python3 property_test.py")
+    print(f"property test (expect failure): {property_result}")
+    if property_result["status"] == "success":
+        print("FAILED: property-based testing did not catch a known-divergent pair")
+        sys.exit(1)
+    print("Property-based testing gate OK (hypothesis available, catches real divergence)")

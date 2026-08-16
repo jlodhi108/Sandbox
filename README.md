@@ -9,20 +9,33 @@ isolated sandbox before accepting it — structural checks, behavioral probes,
 determinism checks, and optional semgrep security scanning — so nothing
 gets written back unless it's proven equivalent to the original.
 
-Supports Python, JavaScript, Java, C++, and PHP out of the box.
+Supports Python, JavaScript, TypeScript, Java, C++, and PHP out of the box.
 
 ## How it works
 
 1. **Chunk** — the target file is parsed (tree-sitter) and split into
    independently modernizable units (functions/methods).
-2. **Modernize** — each chunk is sent to a local model, which rewrites it.
-   Chunks that are already modern are skipped with zero LLM calls.
+2. **Modernize** — each chunk is sent to a local model, which rewrites it,
+   grounded in a short list of real function/type signatures from
+   elsewhere in the same file and (in repo mode) sibling files, PLUS the
+   full definition (fields/methods) of any class/struct/interface the
+   chunk actually references — so the model applies type hints and uses
+   other types correctly instead of guessing at their shape.
+   Chunks that are already modern are skipped with zero LLM calls, and a
+   chunk a provably-safe deterministic rule can handle (e.g. JS `var` →
+   `let`/`const`, PHP `array()` → `[]` — see `deterministic_rules.py`)
+   skips the LLM call too, though it still goes through full verification.
 3. **Verify** — the rewrite is checked structurally, run in a sandboxed
    subprocess (optionally under gVisor/seccomp), probed with fuzzed
-   call-site inputs, and checked for determinism against the original.
-   Failures feed back into the next rewrite attempt (up to
-   `--max-iterations`); a chunk that never passes is left untouched rather
-   than risking a bad write.
+   call-site inputs, checked for determinism against the original, and
+   (for Python/JS/TS/PHP) put through an adversarial counterexample
+   search — the model is shown BOTH versions and asked to actively try
+   to find an input where they'd diverge — and, for fully type-hinted
+   Python functions, a property-based equivalence test (Hypothesis,
+   sampling across the whole input space the type hints admit — see
+   `property_testing.py`). Failures feed back into the
+   next rewrite attempt (up to `--max-iterations`); a chunk that never
+   passes is left untouched rather than risking a bad write.
 4. **(Optional) Escalate** — if a cheap model keeps failing the same chunk,
    retry with a stronger model (`ESCALATION_MODEL`).
 5. **(Optional) Ship** — open a GitHub PR per modernized file (`--pr`), or
@@ -53,6 +66,14 @@ cd Sandbox
 → `.env` and `.modernizer.toml.example` → `.modernizer.toml`, and checks
 that Docker/Ollama are available. Run it once (and again whenever
 `requirements.txt` changes).
+
+Alternatively, install as a package (`pyproject.toml` defines a
+`code-modernizer` console script):
+
+```bash
+pip install -e .
+code-modernizer <path_to_file_or_directory> [flags]
+```
 
 Then pull the model:
 
@@ -96,8 +117,10 @@ Key flags (see `python main.py --help` for the full list):
 | `--recipe NAME` | Scope this run to a named `[recipes.NAME]` table in `.modernizer.toml` |
 | `--watch` | Run an initial full pass, then keep watching `path` and modernize only changed files, forever (Ctrl+C to stop) |
 | `--watch-interval N` | Seconds between change-detection polls in `--watch` mode (default 5) |
+| `--punt-check` | Ask the model to self-assess confidence before attempting each chunk; skip chunks it doubts, before any rewrite attempt |
 | `--run-target-tests` | Run the target repo's own test suite as an extra gate |
-| `--generate-regression-tests` | Generate regression tests for modernized chunks |
+| `--generate-regression-tests` | Generate regression tests (embeds MODERNIZED code) for successfully modernized chunks |
+| `--characterize` | Generate characterization tests (embeds ORIGINAL code) for every chunk attempted, including ones that gave up |
 | `--interactive` | Pause and prompt for approval on flagged chunks |
 | `--report PATH` | Write a structured JSON run report |
 | `--report-html PATH` | Write a self-contained HTML run report (per-chunk status, flags, diffs) — open it in a browser |
@@ -155,6 +178,26 @@ python mcp_server.py
 source .venv/bin/activate
 pytest tests/ -v
 ```
+
+## Self-benchmark
+
+`benchmark.py` runs the real pipeline (real LLM calls, real sandbox
+verification — not a mock) against the fixed fixtures in
+[`legacy_samples/`](legacy_samples/) and reports a per-language success-
+rate scorecard:
+
+```bash
+python benchmark.py --report benchmark-report.json
+```
+
+A repeatable, comparable-over-time quality signal — diff two runs
+before/after a prompt change, threshold tweak, or model swap to see
+whether it actually helped. Needs Docker + Ollama running, same as any
+real run. There's also a weekly scheduled
+[`benchmark.yml`](.github/workflows/benchmark.yml) workflow
+(`workflow_dispatch`-triggerable too) that uploads the report as a CI
+artifact — deliberately never runs on every push/PR, since it makes real
+non-deterministic model calls.
 
 ## Security
 

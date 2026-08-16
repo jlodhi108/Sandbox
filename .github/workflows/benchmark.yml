@@ -1,0 +1,41 @@
+name: benchmark
+
+# Deliberately workflow_dispatch/schedule ONLY — never on push/pull_request.
+# benchmark.py makes real Ollama calls and real Docker sandbox
+# verifications (see benchmark.py's module docstring), so it's slow and
+# would burn CI minutes / non-determinism into every ordinary PR check if
+# it ran there. This is a periodic quality signal, not a merge gate.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"  # weekly, Monday 04:00 UTC
+
+jobs:
+  self-benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: docker build -t sandbox-multi -f sandbox/sandbox-multi.Dockerfile sandbox/
+
+      - name: Install Ollama and pull model
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:11434/ >/dev/null 2>&1 && break
+            sleep 1
+          done
+          ollama pull qwen2.5-coder:14b
+
+      - name: Run self-benchmark
+        run: python benchmark.py --report benchmark-report.json --max-llm-calls 500
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-report
+          path: benchmark-report.json

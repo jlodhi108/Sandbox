@@ -162,7 +162,8 @@ def test_run_file_in_worktree_copies_output_back_to_the_real_tree():
         subprocess.run(["git", "-C", root, "commit", "-q", "-m", "initial"], check=True)
 
         def fake_run_file(file_path, open_pr, max_iterations, standalone_pr=True, sibling_sources=None,
-                           generate_regression_tests=False, interactive=False, recipe_instruction=None):
+                           generate_regression_tests=False, interactive=False, recipe_instruction=None,
+                           **kwargs):
             # Simulate run_file() writing its output INSIDE the worktree
             # it was handed (file_path points there, not at root_dir).
             output_path = file_path.replace("calc.py", "calc.modernized.py")
@@ -432,7 +433,7 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
     files = ["a.py", "b.py", "c.py"]
     delays = {"a.py": 0.05, "b.py": 0.0, "c.py": 0.0}
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False, interactive=False, recipe_instruction=None):
+    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False, interactive=False, recipe_instruction=None, *args, **kwargs):
         time.sleep(delays[file_path])
         return {"file_path": file_path, "chunks_succeeded": 1}
 
@@ -445,7 +446,7 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
 def test_run_files_concurrently_isolates_one_file_erroring():
     files = ["good.py", "bad.py"]
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False, interactive=False, recipe_instruction=None):
+    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False, interactive=False, recipe_instruction=None, *args, **kwargs):
         if file_path == "bad.py":
             raise RuntimeError("boom")
         return {"file_path": file_path, "chunks_succeeded": 1}
@@ -509,3 +510,106 @@ def test_open_combined_pr_includes_only_the_eligible_language():
         assert url == "https://github.com/fake/repo/pull/2"
         files_included = [f[0] for f in mock_pr.call_args[1]["files"]]
         assert files_included == ["a.py"]  # only python, php excluded
+
+
+def test_run_file_counts_punted_chunks_separately_from_gave_up():
+    # Punted chunks must NOT inflate chunks_gave_up (that counter feeds
+    # track_record.py's success-rate calc — a chunk never attempted
+    # shouldn't count as a failed attempt any more than an already-modern
+    # chunk does).
+    import main
+
+    with tempfile.TemporaryDirectory() as root:
+        file_path = os.path.join(root, "calc.py")
+        _touch(file_path, "def legacy_one(x):\n    return '%s' % x\n")
+
+        punted_state = {
+            "status": "gave_up", "punted": True, "iteration_count": 0,
+            "compiler_stderr": "Punted before attempting (pre-rewrite confidence check): unsure",
+            "modernized_code": "", "required_imports": [], "probes": [],
+            "used_escalation": False, "used_deterministic_rule": False,
+            "risk_flag": False, "security_flag": False, "mutation_confidence_flag": False,
+        }
+        with patch("main.modernize", return_value=punted_state):
+            stats = main.run_file(file_path, open_pr=False, max_iterations=5, punt_check_enabled=True)
+
+    assert stats["chunks_punted"] == 1
+    assert stats["chunks_gave_up"] == 0
+    assert stats["chunk_details"][0]["punted"] is True
+
+
+def test_run_file_characterize_writes_test_pinning_original_code():
+    import main
+
+    with tempfile.TemporaryDirectory() as root:
+        file_path = os.path.join(root, "calc.py")
+        _touch(file_path, "def greet(name):\n    return '%s' % name\n")
+
+        fake_state = {
+            "status": "success", "iteration_count": 1,
+            "modernized_code": "def greet(name: str) -> str:\n    return f'{name}'\n",
+            "required_imports": [], "probes": [{"snippet": "print(greet('Bob'))", "baseline_stdout": "Bob\n"}],
+            "used_escalation": False, "used_deterministic_rule": False, "punted": False,
+            "risk_flag": False, "security_flag": False, "mutation_confidence_flag": False,
+            "compiler_stderr": "",
+        }
+        with patch("main.modernize", return_value=fake_state), \
+             patch("main.verify", return_value={"status": "success", "stdout": "Bob\n", "stderr": "", "exit_code": 0}):
+            stats = main.run_file(file_path, open_pr=False, max_iterations=5, characterize=True)
+
+        assert stats["characterization_test_path"] is not None
+        with open(stats["characterization_test_path"]) as f:
+            content = f.read()
+
+    assert "def greet(name):" in content  # ORIGINAL code
+    assert "def greet(name: str) -> str:" not in content  # NOT modernized code
+    compile(content, "<generated>", "exec")
+
+
+def test_run_file_characterize_captures_gave_up_chunks_too():
+    # The safety net matters MOST for chunks this project couldn't
+    # handle — those must still get characterized, not skipped.
+    import main
+
+    with tempfile.TemporaryDirectory() as root:
+        file_path = os.path.join(root, "calc.py")
+        _touch(file_path, "def risky(x):\n    return '%s' % weird_legacy_call(x)\n")
+
+        fake_state = {
+            "status": "gave_up", "punted": False, "iteration_count": 5,
+            "modernized_code": "", "required_imports": [],
+            "probes": [{"snippet": "print(risky(1))", "baseline_stdout": "1\n"}],
+            "used_escalation": False, "used_deterministic_rule": False,
+            "risk_flag": False, "security_flag": False, "mutation_confidence_flag": False,
+            "compiler_stderr": "gave up after 5 attempts",
+        }
+        with patch("main.modernize", return_value=fake_state), \
+             patch("main.verify", return_value={"status": "success", "stdout": "1\n", "stderr": "", "exit_code": 0}):
+            stats = main.run_file(file_path, open_pr=False, max_iterations=5, characterize=True)
+
+        assert stats["characterization_test_path"] is not None
+        with open(stats["characterization_test_path"]) as f:
+            content = f.read()
+
+    assert "def risky(x):" in content
+
+
+def test_run_file_characterize_off_by_default():
+    import main
+
+    with tempfile.TemporaryDirectory() as root:
+        file_path = os.path.join(root, "calc.py")
+        _touch(file_path, "def greet(name):\n    return '%s' % name\n")
+
+        fake_state = {
+            "status": "success", "iteration_count": 1,
+            "modernized_code": "def greet(name: str) -> str:\n    return f'{name}'\n",
+            "required_imports": [], "probes": [{"snippet": "print(greet('Bob'))", "baseline_stdout": "Bob\n"}],
+            "used_escalation": False, "used_deterministic_rule": False, "punted": False,
+            "risk_flag": False, "security_flag": False, "mutation_confidence_flag": False,
+            "compiler_stderr": "",
+        }
+        with patch("main.modernize", return_value=fake_state):
+            stats = main.run_file(file_path, open_pr=False, max_iterations=5)
+
+    assert stats["characterization_test_path"] is None

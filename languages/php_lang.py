@@ -25,6 +25,10 @@ class PhpHandler(LanguageHandler):
     (function_definition) @function
     (method_declaration) @function
     """
+    type_definition_query_src = """
+    (class_declaration name: (name) @name) @def
+    (interface_declaration name: (name) @name) @def
+    """
     parse_wrapper_prefix = "<?php\n"
 
     def run_command(self) -> str:

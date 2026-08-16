@@ -2,8 +2,14 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.hypothesis/
 .env
 *.modernized.*
 *.egg-info/
 build/
 dist/
+
+# Local track-record state (see track_record.py) — accumulated per-
+# machine run history that gates auto-PR eligibility, not source. Never
+# meant to be shared/committed; each clone/machine builds its own.
+.modernizer_history.json

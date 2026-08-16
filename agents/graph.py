@@ -1,9 +1,11 @@
+import re
+
 from langgraph.graph import StateGraph, END
 
 from agents.state import AgentState
 from agents.nodes import (
     refactorer_node, verifier_node, fallback_node, assess_risk, scan_security,
-    generate_probes, wrap_call_as_probe, check_mutation_confidence,
+    generate_probes, wrap_call_as_probe, check_mutation_confidence, assess_punt,
 )
 from agents.review_graph import start_review
 from languages import get_handler_by_name
@@ -11,6 +13,9 @@ from sandbox.verifier import verify
 
 MAX_PROBES_PER_CHUNK = 3
 MAX_REAL_CALL_SITE_PROBES = 2
+MAX_CONTEXT_SIGNATURES = 20
+MAX_CONTEXT_SIBLING_FILES = 5
+MAX_TYPE_DEFINITIONS = 5
 
 
 def router(state: AgentState) -> str:
@@ -136,6 +141,133 @@ def _capture_function_probes(
     return probes
 
 
+def _extract_context_signatures(
+    handler, full_source: bytes, chunk_start: int, chunk_end: int, sibling_sources: list[bytes] | None,
+) -> list[str]:
+    """One-line signatures of every OTHER function/method in the current
+    file, plus a bounded sample from sibling files (repo mode only) —
+    grounding for the refactor prompt so the model can reference the
+    codebase's ACTUAL names/types with confidence instead of guessing.
+    This is the scoped-down, same-language version of the "static
+    analysis first" idea from AlphaTrans/LegacyTranslate-style
+    architectures: those build a full cross-language project skeleton
+    because they translate BETWEEN languages and need to resolve types
+    across that boundary; this project modernizes Python-to-Python,
+    JS-to-JS, etc., so a short list of real signatures already visible
+    via the chunking this project already does is the right-sized
+    version of the same idea, not a new dependency-resolution system.
+
+    Deliberately reuses handler.chunk() (the same tree-sitter chunking
+    every file already goes through) rather than a new per-language
+    signature-extraction query — each chunk's FIRST LINE is taken as
+    its "signature", which is exact for single-line signatures (the
+    overwhelming majority of real code) and merely truncated-looking
+    (not wrong, not crash-prone) for multi-line ones. This is
+    informational text injected into a prompt, never executed, so an
+    imperfect label costs nothing beyond being slightly less helpful.
+
+    Capped at MAX_CONTEXT_SIGNATURES total and MAX_CONTEXT_SIBLING_FILES
+    sibling files scanned — repo mode can have arbitrarily many sibling
+    files, and this is meant to give the model a FEW grounding examples,
+    not the whole codebase (which would blow out the prompt and defeat
+    the purpose: a wall of unrelated signatures is noise, not grounding)."""
+    signatures: list[str] = []
+    seen: set[str] = set()
+
+    def _collect(source: bytes, skip_range: tuple[int, int] | None) -> bool:
+        for c in handler.chunk(source):
+            if skip_range is not None and (c.start_byte, c.end_byte) == skip_range:
+                continue  # the chunk being modernized itself
+            first_line = c.code.splitlines()[0].strip() if c.code.strip() else ""
+            if first_line and first_line not in seen:
+                seen.add(first_line)
+                signatures.append(first_line)
+            if len(signatures) >= MAX_CONTEXT_SIGNATURES:
+                return True
+        return False
+
+    if _collect(full_source, (chunk_start, chunk_end)):
+        return signatures
+    for sibling_source in (sibling_sources or [])[:MAX_CONTEXT_SIBLING_FILES]:
+        if _collect(sibling_source, None):
+            return signatures
+    return signatures
+
+
+def _extract_referenced_type_definitions(
+    handler, chunk_code: str, full_source: bytes, sibling_sources: list[bytes] | None,
+) -> list[str]:
+    """Full source text of every class/struct/interface definition whose
+    NAME appears as a whole word inside chunk_code (the function being
+    modernized) — a deeper form of the same grounding
+    _extract_context_signatures provides: instead of just the type's
+    NAME, the model sees its actual fields/methods, so it can safely
+    apply type hints or construct/use the type correctly instead of
+    guessing at its shape. Scoped to the current file plus a bounded
+    sibling sample (MAX_CONTEXT_SIBLING_FILES, same repo-mode-can-have-
+    arbitrarily-many-files reasoning as _extract_context_signatures).
+
+    Word-containment (not formal parameter-type-hint parsing) is a
+    deliberate trade-off: precisely parsing "this chunk's declared
+    parameter types" needs a DIFFERENT exact query per language grammar
+    (Python type hints, TS type annotations, Java/C++/PHP typed
+    parameters are all shaped differently) for a benefit this simpler
+    check already delivers — a type referenced ANYWHERE in the chunk (a
+    parameter type, a local variable's type, a `new Foo()` call, a
+    static method reference) is exactly as useful to ground as one
+    referenced only in the signature, and a whole-word regex match
+    works identically across every language's syntax rather than
+    needing 5 different implementations. Uses handler.
+    type_definition_query_src (see languages/base.py) — empty for a
+    language that doesn't define it, degrading to an empty result the
+    same way every other "can I do this for this language" check in
+    this project does."""
+    if not handler.type_definition_query_src:
+        return []
+
+    types_found: dict[str, tuple[bytes, int, int]] = {}
+    for name, (start, end) in handler.extract_type_definitions(full_source).items():
+        types_found.setdefault(name, (full_source, start, end))
+    for sibling_source in (sibling_sources or [])[:MAX_CONTEXT_SIBLING_FILES]:
+        for name, (start, end) in handler.extract_type_definitions(sibling_source).items():
+            types_found.setdefault(name, (sibling_source, start, end))
+
+    definitions = []
+    for name, (source, start, end) in types_found.items():
+        if len(definitions) >= MAX_TYPE_DEFINITIONS:
+            break
+        if re.search(rf"\b{re.escape(name)}\b", chunk_code):
+            definitions.append(source[start:end].decode("utf-8"))
+    return definitions
+
+
+def _punted_initial_state(
+    language: str, full_source: bytes, chunk_start: int, chunk_end: int,
+    original_code: str, max_iterations: int, recipe_instruction: str | None, punt_reason: str,
+) -> AgentState:
+    """A chunk skipped by assess_punt BEFORE any rewrite attempt — same
+    terminal "gave_up" status every other unwritten chunk gets (main.py
+    only branches on status/punted, not on a THIRD status value), just
+    with iteration_count staying 0 and punted=True so callers can tell
+    the difference. Every other field is a safe, unused default: nothing
+    downstream reads probes/candidate_codes/etc. for a chunk this state
+    machine never actually entered the graph for."""
+    return {
+        "language": language, "full_source": full_source,
+        "chunk_start": chunk_start, "chunk_end": chunk_end,
+        "original_code": original_code, "modernized_code": "", "required_imports": [],
+        "candidate_codes": [], "baseline_stdout": None, "probes": [],
+        "context_signatures": [], "referenced_type_definitions": [],
+        "used_escalation": False, "used_deterministic_rule": False,
+        "risk_flag": False, "risk_reason": "", "security_flag": False, "security_findings": [],
+        "mutation_confidence_flag": False, "mutation_confidence_reason": "",
+        "review_thread_id": None,
+        "compiler_stderr": f"Punted before attempting (pre-rewrite confidence check): {punt_reason}",
+        "iteration_count": 0, "status": "gave_up", "max_iterations": max_iterations,
+        "recipe_instruction": recipe_instruction, "punted": True,
+    }
+
+
 def modernize(
     language: str,
     full_source: bytes,
@@ -145,11 +277,28 @@ def modernize(
     sibling_sources: list[bytes] | None = None,
     interactive: bool = False,
     recipe_instruction: str | None = None,
+    punt_check_enabled: bool = False,
 ) -> AgentState:
-    app = build_graph()
     original_code = full_source[chunk_start:chunk_end].decode("utf-8")
+
+    if punt_check_enabled:
+        # Runs BEFORE baseline/probe capture too (not just before the
+        # graph) — those already cost sandbox time, and there's no point
+        # spending it on a chunk about to be skipped anyway.
+        punt_flag, punt_reason = assess_punt(language, original_code)
+        if punt_flag:
+            print(f"    (punted before attempting: {punt_reason})")
+            return _punted_initial_state(
+                language, full_source, chunk_start, chunk_end,
+                original_code, max_iterations, recipe_instruction, punt_reason,
+            )
+
+    app = build_graph()
+    handler = get_handler_by_name(language)
     baseline_stdout = _capture_baseline_stdout(language, full_source)
     probes = _capture_function_probes(language, full_source, original_code, sibling_sources)
+    context_signatures = _extract_context_signatures(handler, full_source, chunk_start, chunk_end, sibling_sources)
+    referenced_type_definitions = _extract_referenced_type_definitions(handler, original_code, full_source, sibling_sources)
     initial_state: AgentState = {
         "language": language,
         "full_source": full_source,
@@ -161,7 +310,11 @@ def modernize(
         "candidate_codes": [],
         "baseline_stdout": baseline_stdout,
         "probes": probes,
+        "context_signatures": context_signatures,
+        "referenced_type_definitions": referenced_type_definitions,
         "used_escalation": False,
+        "used_deterministic_rule": False,
+        "punted": False,
         "risk_flag": False,
         "risk_reason": "",
         "security_flag": False,

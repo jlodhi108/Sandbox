@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g typescript ts-node \
-    && pip install --no-cache-dir --break-system-packages semgrep \
+    && pip install --no-cache-dir --break-system-packages semgrep hypothesis \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Local, offline rule file — NOT a semgrep registry config (`p/...`).

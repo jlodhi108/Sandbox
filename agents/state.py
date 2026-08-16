@@ -34,9 +34,49 @@ class AgentState(TypedDict):
                              # codebase plus LLM-synthesized diverse
                              # examples. Empty list if unsupported for
                              # this language or none could be verified.
+    context_signatures: list[str]  # one-line signatures of OTHER functions/
+                                     # types already in this codebase (same
+                                     # file + a bounded sample of sibling
+                                     # files in repo mode) — captured once up
+                                     # front via agents/graph.py:
+                                     # _extract_context_signatures, injected
+                                     # into the refactor/fix prompts so the
+                                     # model can reference real names instead
+                                     # of guessing. Empty list if none found
+                                     # (e.g. single-file mode with no other
+                                     # functions in the file).
+    referenced_type_definitions: list[str]  # FULL source of every class/
+                                     # struct/interface definition whose
+                                     # name appears as a whole word in this
+                                     # chunk — deeper grounding than
+                                     # context_signatures' one-line names:
+                                     # the model sees the type's actual
+                                     # fields/methods, not just its name.
+                                     # See agents/graph.py:
+                                     # _extract_referenced_type_definitions.
+                                     # Empty for languages with no
+                                     # type_definition_query_src (see
+                                     # languages/base.py) or chunks that
+                                     # reference no locally-defined type.
     used_escalation: bool   # True once any attempt on this chunk used the
                              # stronger escalation model, not just the
                              # default — surfaced in the run report
+    used_deterministic_rule: bool  # True if the WINNING candidate came from
+                                     # deterministic_rules.py (a provably
+                                     # safe syntactic rewrite) instead of the
+                                     # LLM — see refactorer_node's fast path.
+                                     # Set False by default; overwritten True
+                                     # only on the attempt(s) that used it.
+    punted: bool             # True if this chunk was skipped BEFORE any
+                             # rewrite attempt at all (see --punt-check /
+                             # agents/nodes.py:assess_punt) — status is
+                             # still "gave_up" (same terminal contract as
+                             # every other unwritten chunk), but callers
+                             # that want to distinguish "genuinely tried
+                             # and failed" from "never attempted" (e.g.
+                             # track_record.py's success-rate calc, which
+                             # must not penalize a language for chunks it
+                             # never actually tried) check this flag.
     risk_flag: bool         # set post-graph, only on success: does this
                              # change touch something a stdout-diff test
                              # can't prove is equivalent (I/O, globals,

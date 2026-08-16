@@ -9,6 +9,24 @@
 [settings]
 max_iterations = 5
 workers = 1
+#
+# Requires workers > 1 and the target to be a git repository. Each
+# concurrent worker reads/writes inside its own `git worktree` checkout
+# instead of the shared directory directly — see --isolate-workers'
+# --help text and git_ops/worktree.py's module docstring for exactly
+# what this does and doesn't protect against. Off by default: a
+# worktree checkout per file isn't free, and nothing in the pipeline
+# actually races without it today.
+# isolate_workers = true
+#
+# Seconds between change-detection polls in --watch mode.
+# watch_interval_seconds = 5
+#
+# Shortcut for --recipe NAME — selects a [recipes.NAME] table defined
+# further down this file (see the [recipes.*] section below). Equivalent
+# to passing --recipe on the command line every time.
+# recipe = "callbacks-to-async"
+#
 # report = "modernizer-report.json"
 #
 # Self-contained HTML counterpart to `report` above — per-chunk status,
@@ -51,6 +69,19 @@ workers = 1
 # avoid writing files the user didn't ask for on every run.
 # generate_regression_tests = true
 #
+# For EVERY chunk this run looks at — successful AND gave-up — write its
+# captured verification probes into a standalone "characterization test"
+# file that embeds the ORIGINAL (pre-modernization) code, not the
+# modernized version (e.g. calc.py -> test_calc_characterization.py).
+# Pins down what the legacy code actually does today, quirks and bugs
+# included, as a permanent safety net — matters MOST for chunks this
+# project couldn't successfully modernize, since --generate-regression-
+# tests above only ever covers successful ones. Independent of
+# --generate-regression-tests; enable both to get both. Chunks skipped
+# by punt_check capture no probe data and are never characterized.
+# Supported for python/javascript/typescript/php; a no-op for cpp/java.
+# characterize = true
+#
 # Pause on any chunk flagged (risk, security, or low-confidence mutation
 # check) and prompt right here in the terminal to approve or reject it,
 # instead of just flagging and continuing — see agents/review_graph.py.
@@ -60,6 +91,19 @@ workers = 1
 # outside the graph. Not supported together with workers > 1 (concurrent
 # prompts would garble the terminal) — CLI refuses that combination.
 # interactive = true
+#
+# Before attempting each chunk, ask the model to self-assess whether
+# it's confident it can modernize THIS specific chunk correctly. If not,
+# the chunk is skipped before any rewrite attempt (no best-of-N
+# generation, no sandbox verification) — costs one extra LLM call per
+# chunk to potentially save a much larger one on chunks the model
+# already doubts. Punted chunks are excluded from track_record.py's
+# success-rate calculation (see main.py's chunks_punted stat) — a chunk
+# never attempted isn't a failed attempt. Off by default: it's a genuine
+# tradeoff (an extra LLM call per chunk, and a false-positive punt means
+# a chunk that would have succeeded gets skipped instead), not a strict
+# improvement for every workload.
+# punt_check = true
 
 [escalation]
 # model = "qwen2.5-coder:32b"

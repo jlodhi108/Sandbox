@@ -30,6 +30,7 @@ from track_record import load_history, save_history, record_run, is_eligible
 from llm_budget import BudgetExceededError
 from target_tests import detect_test_command, run_test_command, run_target_tests_on_copy
 from regression_tests import generate_regression_test_file, regression_test_filename
+from characterization_tests import generate_characterization_test_file, characterization_test_filename
 
 # Loaded once at startup, read against for every auto-PR eligibility
 # check this run makes — always reflects PRIOR runs only. Updated with
@@ -137,7 +138,7 @@ def _format_flags_section(
     return "\n\n".join(parts)
 
 
-def _isolate_probe_baselines(handler, chunks: list[dict]) -> list[dict]:
+def _isolate_probe_baselines(handler, chunks: list[dict], source_field: str = "modernized_code") -> list[dict]:
     """The `baseline_stdout` recorded on each probe during normal
     verification is NOT the probe's own isolated output — _verify_candidate
     runs the WHOLE candidate file with the probe appended (needed to prove
@@ -145,23 +146,31 @@ def _isolate_probe_baselines(handler, chunks: list[dict]) -> list[dict]:
     baseline is contaminated by the original file's own top-level side
     effects (confirmed by a real run: a file with its own `print(add(2,3))`
     at the bottom produced baseline_stdout='5\\n5\\n' for a probe that
-    itself only prints once). A durable regression test should isolate the
-    function under test, not replicate that whole-file artifact — so this
-    re-runs each probe against JUST the modernized function (already
-    proven correct) to capture a clean, function-only baseline instead of
-    reusing the recorded one. One extra sandbox call per probe, only when
-    --generate-regression-tests is on; skipped entirely otherwise."""
+    itself only prints once). A durable regression/characterization test
+    should isolate the function under test, not replicate that whole-file
+    artifact — so this re-runs each probe against JUST the function
+    (already proven correct against ITSELF, whichever version source_field
+    names) to capture a clean, function-only baseline instead of reusing
+    the recorded one. One extra sandbox call per probe, only when
+    --generate-regression-tests or --characterize is on; skipped entirely
+    otherwise.
+
+    source_field selects which field of each chunk dict to isolate against:
+    "modernized_code" (default, for --generate-regression-tests — the
+    function ALREADY passed full verification against this exact source)
+    or "original_code" (for --characterize — pinning behavior BEFORE any
+    rewrite, so there's no "modernized" version to use yet)."""
     isolated = []
     for chunk in chunks:
         clean_probes = []
         for probe in chunk["probes"]:
             candidate = (
-                chunk["modernized_code"].encode("utf-8") + b"\n" + probe["snippet"].encode("utf-8") + b"\n"
+                chunk[source_field].encode("utf-8") + b"\n" + probe["snippet"].encode("utf-8") + b"\n"
             )
             result = verify(candidate.decode("utf-8"), handler.sandbox_filename, handler.run_command())
             if result["status"] == "success":
                 clean_probes.append({"snippet": probe["snippet"], "baseline_stdout": result["stdout"]})
-        isolated.append({"modernized_code": chunk["modernized_code"], "probes": clean_probes})
+        isolated.append({source_field: chunk[source_field], "probes": clean_probes})
     return isolated
 
 
@@ -280,7 +289,8 @@ def run_file(
     file_path: str, open_pr: bool, max_iterations: int,
     standalone_pr: bool = True, sibling_sources: list[bytes] | None = None,
     generate_regression_tests: bool = False, interactive: bool = False,
-    recipe_instruction: str | None = None,
+    recipe_instruction: str | None = None, punt_check_enabled: bool = False,
+    characterize: bool = False,
 ) -> dict:
     """Modernize one file. Returns a stats dict (also the data source for
     --report) rather than just printing, so repo mode can aggregate
@@ -325,6 +335,7 @@ def run_file(
         "chunks_succeeded": 0,
         "chunks_already_modern": 0,
         "chunks_gave_up": 0,
+        "chunks_punted": 0,
         "chunks_budget_exceeded": 0,
         "risk_flagged": [],
         "security_flagged": [],
@@ -334,6 +345,7 @@ def run_file(
         "final_check_passed": None,
         "pr_url": None,
         "regression_test_path": None,
+        "characterization_test_path": None,
         "duration_seconds": None,
     }
 
@@ -347,6 +359,7 @@ def run_file(
     # prepending mid-loop would shift byte offsets for chunks not yet
     # processed, since they all sit before the insertion point
     successful_chunks_for_regression_tests: list[dict] = []
+    all_chunks_for_characterization: list[dict] = []
     for chunk in sorted(chunks, key=lambda c: c.start_byte, reverse=True):
         print(f"\n--- Modernizing {chunk.kind} [{chunk.start_byte}:{chunk.end_byte}] ---")
         chunk_start_time = time.time()
@@ -366,6 +379,7 @@ def run_file(
                 handler.name, working_source, chunk.start_byte, chunk.end_byte,
                 max_iterations=max_iterations, sibling_sources=sibling_sources,
                 interactive=interactive, recipe_instruction=recipe_instruction,
+                punt_check_enabled=punt_check_enabled,
             )
             if final_state["status"] == "awaiting_review":
                 final_state = _resolve_interactive_review(final_state)
@@ -394,6 +408,8 @@ def run_file(
             "status": final_state["status"],
             "iterations": final_state["iteration_count"],
             "used_escalation": final_state.get("used_escalation", False),
+            "used_deterministic_rule": final_state.get("used_deterministic_rule", False),
+            "punted": final_state.get("punted", False),
             "probe_count": len(final_state.get("probes") or []),
             "risk_flag": final_state.get("risk_flag", False),
             "security_flag": final_state.get("security_flag", False),
@@ -408,6 +424,21 @@ def run_file(
                 print(diff_text)
 
         stats["chunk_details"].append(chunk_detail)
+
+        if characterize and final_state.get("probes"):
+            # Captured regardless of final status (success OR gave_up) —
+            # probes are captured against the ORIGINAL code before
+            # refactorer_node ever runs (see agents/graph.py:modernize),
+            # so a chunk this project couldn't successfully modernize
+            # still leaves behind a durable record of what it used to do.
+            # Excludes punted chunks (--punt-check skips probe capture
+            # entirely — see agents/graph.py:_punted_initial_state) and
+            # already-modern chunks (`continue`d above, never reach here;
+            # nothing "legacy" to characterize about already-modern code).
+            all_chunks_for_characterization.append({
+                "original_code": chunk.code,
+                "probes": final_state["probes"],
+            })
 
         if final_state["status"] == "success":
             new_code = final_state["modernized_code"].encode("utf-8")
@@ -443,10 +474,40 @@ def run_file(
                     "kind": chunk.kind, "start_byte": chunk.start_byte,
                 })
             stats["chunks_succeeded"] += 1
+        elif final_state.get("punted"):
+            # Punted BEFORE any attempt (see --punt-check) — deliberately
+            # NOT folded into chunks_gave_up: that counter feeds
+            # track_record.py's success-rate calculation, and a chunk
+            # that was never actually tried shouldn't count as a failed
+            # attempt any more than an already-modern chunk does (see
+            # record_run's docstring on why chunks_already_modern is
+            # excluded the same way).
+            print(f"SKIPPED (punted before attempting): {chunk.kind} at byte {chunk.start_byte}")
+            print(f"reason:\n{final_state['compiler_stderr']}")
+            stats["chunks_punted"] += 1
         else:
             print(f"SKIPPED (gave up): {chunk.kind} at byte {chunk.start_byte}")
             print(f"last error:\n{final_state['compiler_stderr']}")
             stats["chunks_gave_up"] += 1
+
+    if characterize:
+        # Deliberately BEFORE the succeeded==0 early return below —
+        # characterization exists precisely FOR the case a file's
+        # modernization completely failed: a permanent safety net for
+        # the original behavior even when this project couldn't handle
+        # any of it, not just a bonus for files that mostly succeeded.
+        isolated_characterization_chunks = _isolate_probe_baselines(
+            handler, all_chunks_for_characterization, source_field="original_code",
+        )
+        characterization_source = generate_characterization_test_file(handler.name, isolated_characterization_chunks)
+        if characterization_source is None:
+            print("\n--characterize: no probes captured for this file — nothing to write.")
+        else:
+            characterization_path = characterization_test_filename(handler.name, file_path)
+            with open(characterization_path, "w") as f:
+                f.write(characterization_source)
+            stats["characterization_test_path"] = characterization_path
+            print(f"Wrote characterization test to {characterization_path} (pins ORIGINAL behavior, pre-modernization)")
 
     succeeded = stats["chunks_succeeded"]
     already_modern_count = stats["chunks_already_modern"]
@@ -632,7 +693,8 @@ def _read_all_file_contents(files: list[str]) -> dict[str, bytes]:
 
 def _run_file_in_worktree(
     root_dir: str, file_path: str, open_pr: bool, max_iterations: int, sibling_sources: list[bytes],
-    generate_regression_tests: bool, recipe_instruction: str | None,
+    generate_regression_tests: bool, recipe_instruction: str | None, punt_check_enabled: bool = False,
+    characterize: bool = False,
 ) -> dict:
     """Same job as run_file(), but the actual read/chunk/verify/write
     cycle runs against a dedicated git worktree checkout of root_dir
@@ -653,12 +715,13 @@ def _run_file_in_worktree(
             standalone_pr=False, sibling_sources=sibling_sources,
             generate_regression_tests=generate_regression_tests,
             interactive=False, recipe_instruction=recipe_instruction,
+            punt_check_enabled=punt_check_enabled, characterize=characterize,
         )
         # Report paths relative to the REAL tree, not the throwaway
         # worktree — everything downstream (--report, the combined PR,
         # --run-target-tests overlay) expects paths under root_dir.
         stats["file_path"] = file_path
-        for path_key in ("output_path", "regression_test_path"):
+        for path_key in ("output_path", "regression_test_path", "characterization_test_path"):
             wt_path = stats.get(path_key)
             if wt_path and os.path.isfile(wt_path):
                 real_path = os.path.join(root_dir, os.path.relpath(wt_path, worktree_path))
@@ -672,7 +735,8 @@ def _run_file_in_worktree(
 def _run_files_concurrently(
     files: list[str], open_pr: bool, max_iterations: int, workers: int, file_contents: dict[str, bytes],
     generate_regression_tests: bool = False, recipe_instruction: str | None = None,
-    root_dir: str | None = None, isolate_workers: bool = False,
+    root_dir: str | None = None, isolate_workers: bool = False, punt_check_enabled: bool = False,
+    characterize: bool = False,
 ) -> list[dict]:
     """Run run_file() for independent files in parallel. Safe because
     files don't share state — only chunks WITHIN a single file have an
@@ -696,12 +760,12 @@ def _run_files_concurrently(
             if isolate_workers:
                 future = executor.submit(
                     _run_file_in_worktree, root_dir, file_path, open_pr, max_iterations, siblings,
-                    generate_regression_tests, recipe_instruction,
+                    generate_regression_tests, recipe_instruction, punt_check_enabled, characterize,
                 )
             else:
                 future = executor.submit(
                     run_file, file_path, open_pr, max_iterations, False, siblings, generate_regression_tests,
-                    False, recipe_instruction,
+                    False, recipe_instruction, punt_check_enabled, characterize,
                 )
             future_to_index[future] = i
         for future in as_completed(future_to_index):
@@ -718,7 +782,8 @@ def _run_files_concurrently(
 def run_repo(
     root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1, run_target_tests: bool = False,
     generate_regression_tests: bool = False, interactive: bool = False,
-    recipe_instruction: str | None = None, isolate_workers: bool = False,
+    recipe_instruction: str | None = None, isolate_workers: bool = False, punt_check_enabled: bool = False,
+    characterize: bool = False,
 ) -> list[dict]:
     global _last_target_test_result
     _last_target_test_result = None
@@ -768,7 +833,7 @@ def run_repo(
         )
         all_stats = _run_files_concurrently(
             files, open_pr, max_iterations, workers, file_contents, generate_regression_tests,
-            recipe_instruction, root_dir, isolate_workers,
+            recipe_instruction, root_dir, isolate_workers, punt_check_enabled, characterize,
         )
     else:
         all_stats = []
@@ -793,6 +858,7 @@ def run_repo(
                     standalone_pr=False, sibling_sources=siblings,
                     generate_regression_tests=generate_regression_tests,
                     interactive=interactive, recipe_instruction=recipe_instruction,
+                    punt_check_enabled=punt_check_enabled, characterize=characterize,
                 )
             except Exception as e:
                 print(f"ERROR processing {file_path}: {e}")
@@ -884,7 +950,7 @@ def watch_run(
     root_dir: str, open_pr: bool, max_iterations: int,
     generate_regression_tests: bool = False, recipe_instruction: str | None = None,
     poll_interval_seconds: int = 5, initial_pass: bool = True,
-    _max_polls: int | None = None,
+    punt_check_enabled: bool = False, characterize: bool = False, _max_polls: int | None = None,
 ) -> None:
     """Long-running incremental mode: modernize root_dir once (unless
     initial_pass=False), then poll for file changes and modernize ONLY
@@ -910,7 +976,8 @@ def watch_run(
         print("\n--watch: running an initial full pass before watching for changes...")
         run_repo(root_dir, open_pr, max_iterations, workers=1,
                  generate_regression_tests=generate_regression_tests,
-                 recipe_instruction=recipe_instruction)
+                 recipe_instruction=recipe_instruction, punt_check_enabled=punt_check_enabled,
+                 characterize=characterize)
 
     known_mtimes = _scan_mtimes(root_dir)
     polls = 0
@@ -933,7 +1000,8 @@ def watch_run(
                         file_path, open_pr, max_iterations,
                         standalone_pr=open_pr, sibling_sources=siblings,
                         generate_regression_tests=generate_regression_tests,
-                        recipe_instruction=recipe_instruction,
+                        recipe_instruction=recipe_instruction, punt_check_enabled=punt_check_enabled,
+                        characterize=characterize,
                     )
                 except Exception as e:
                     print(f"--watch: ERROR processing {file_path}: {e}")
@@ -1092,6 +1160,10 @@ def write_html_report(report_path: str, mode: str, results: list[dict]) -> None:
                 flags.append('<span class="badge badge-warn">low-confidence</span>')
             if c.get("used_escalation"):
                 flags.append('<span class="badge badge-neutral">escalated</span>')
+            if c.get("used_deterministic_rule"):
+                flags.append('<span class="badge badge-success">deterministic</span>')
+            if c.get("punted"):
+                flags.append('<span class="badge badge-neutral">punted</span>')
             diff_html = (
                 f'<details><summary>diff</summary><pre class="diff">{_html_escape(c["diff"])}</pre></details>'
                 if c.get("diff") else ""
@@ -1112,7 +1184,8 @@ def write_html_report(report_path: str, mode: str, results: list[dict]) -> None:
             f'<span class="lang">{_html_escape(s.get("language", ""))}</span></h2>'
             f'<p>{s.get("chunks_succeeded", 0)}/{s.get("chunks_total", 0)} chunk(s) succeeded, '
             f'{s.get("chunks_already_modern", 0)} already modern, '
-            f'{s.get("chunks_gave_up", 0)} gave up</p>'
+            f'{s.get("chunks_gave_up", 0)} gave up, '
+            f'{s.get("chunks_punted", 0)} punted before attempting</p>'
             f'<table><thead><tr><th>Chunk</th><th>Status</th><th>Iters</th>'
             f'<th>Flags</th><th>Time</th><th>Diff</th></tr></thead>'
             f"<tbody>{''.join(rows)}</tbody></table></section>"
@@ -1225,6 +1298,19 @@ def main():
              "all); a no-op for cpp/java.",
     )
     parser.add_argument(
+        "--characterize", action="store_true",
+        default=_settings.get("characterize", False),
+        help="For every chunk this run looks at (successful or given up on — NOT chunks "
+             "skipped by --punt-check, which capture no probe data), write its ORIGINAL "
+             "(pre-modernization) behavior — including quirks/bugs — into a standalone, "
+             "durable characterization test file, so a chunk this project couldn't handle "
+             "still leaves behind a safety net for a human (or a future attempt) to check "
+             "against. Independent of --generate-regression-tests (which only covers "
+             "successful chunks and embeds the MODERNIZED code) — use both to get both. "
+             "New sibling file only (e.g. test_calc_characterization.py) — never overwrites "
+             "anything. Supported for python/javascript/typescript/php; a no-op for cpp/java.",
+    )
+    parser.add_argument(
         "--interactive", action="store_true", default=_settings.get("interactive", False),
         help="Pause on any chunk flagged (risk, security, or low-confidence mutation check) "
              "and prompt right here in the terminal to approve or reject it, instead of just "
@@ -1250,6 +1336,16 @@ def main():
     parser.add_argument(
         "--watch-interval", type=int, default=_settings.get("watch_interval_seconds", 5),
         help="Seconds between change-detection polls in --watch mode (default 5).",
+    )
+    parser.add_argument(
+        "--punt-check", action="store_true", default=_settings.get("punt_check", False),
+        help="Before attempting each chunk, ask the model to self-assess whether it's "
+             "confident it can modernize this specific chunk correctly. If it isn't, the "
+             "chunk is skipped BEFORE any rewrite attempt (no best-of-N generation, no "
+             "sandbox verification) — costs one extra LLM call per chunk to potentially save "
+             "a much larger one on chunks the model already doubts. Punted chunks are NOT "
+             "counted toward a language's track record (see track_record.py) — a chunk never "
+             "attempted isn't a failed attempt.",
     )
     args = parser.parse_args()
 
@@ -1289,6 +1385,8 @@ def main():
             generate_regression_tests=args.generate_regression_tests,
             recipe_instruction=_recipe_instruction,
             poll_interval_seconds=args.watch_interval,
+            punt_check_enabled=args.punt_check,
+            characterize=args.characterize,
         )
         return
 
@@ -1306,6 +1404,7 @@ def main():
             args.path, args.pr, args.max_iterations, args.workers,
             args.run_target_tests, args.generate_regression_tests, args.interactive,
             recipe_instruction=_recipe_instruction, isolate_workers=args.isolate_workers,
+            punt_check_enabled=args.punt_check, characterize=args.characterize,
         )
         mode = "repo"
     else:
@@ -1313,6 +1412,7 @@ def main():
             args.path, args.pr, args.max_iterations,
             generate_regression_tests=args.generate_regression_tests,
             interactive=args.interactive, recipe_instruction=_recipe_instruction,
+            punt_check_enabled=args.punt_check, characterize=args.characterize,
         )]
         mode = "file"
 
