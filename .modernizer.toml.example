@@ -132,3 +132,33 @@ workers = 1
 # tracing = true
 # project = "code-modernizer"
 # endpoint = "https://api.smith.langchain.com"  # only for self-hosted LangSmith
+
+# Named modernization recipes, selected via --recipe NAME. Each table's
+# `instruction` is appended to the base per-language system prompt for
+# EVERY chunk in the run — use it to scope WHAT KIND of modernization
+# happens, not just "make it modern" in general. Without --recipe, none
+# of this applies and behavior is unchanged. Define as many as you like;
+# these three are examples, not defaults.
+#
+# [recipes.callbacks-to-async]
+# instruction = """
+# Only modernize functions that use callback-style asynchronous patterns
+# (a function taking a callback parameter, or Node-style
+# error-first callbacks). Convert them to async/await. Leave every other
+# function completely untouched, even if it has other legacy patterns —
+# do not modernize unrelated things in the same run.
+# """
+#
+# [recipes.py2-to-py3]
+# instruction = """
+# Focus specifically on Python 2 -> 3 incompatibilities: print statements
+# to print(), unicode/str handling, integer division, dict .iteritems()/
+# .has_key(), and similar. Don't make unrelated style changes.
+# """
+#
+# [recipes.jquery-to-vanilla]
+# instruction = """
+# Replace jQuery API usage ($(...), .ajax, .on, .css, etc.) with
+# equivalent vanilla DOM APIs (querySelector, fetch, addEventListener,
+# style property access). Leave non-jQuery-related code as-is.
+# """

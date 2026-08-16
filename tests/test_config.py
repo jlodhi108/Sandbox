@@ -1,7 +1,7 @@
 import os
 import tempfile
 
-from config import load_config, apply_config_to_environment
+from config import load_config, apply_config_to_environment, load_recipes
 
 
 def test_load_config_returns_empty_dict_when_file_missing():
@@ -19,6 +19,35 @@ def test_load_config_parses_toml():
         assert config["settings"]["workers"] == 3
     finally:
         os.unlink(path)
+
+
+def test_load_recipes_extracts_instruction_strings():
+    config = {
+        "recipes": {
+            "callbacks-to-async": {"instruction": "Convert callbacks to async/await."},
+            "py2-to-py3": {"instruction": "Fix Python 2/3 incompatibilities."},
+        }
+    }
+    recipes = load_recipes(config)
+    assert recipes == {
+        "callbacks-to-async": "Convert callbacks to async/await.",
+        "py2-to-py3": "Fix Python 2/3 incompatibilities.",
+    }
+
+
+def test_load_recipes_returns_empty_dict_when_no_recipes_table():
+    assert load_recipes({}) == {}
+
+
+def test_load_recipes_skips_malformed_entries():
+    config = {
+        "recipes": {
+            "good": {"instruction": "Do the thing."},
+            "missing_instruction": {"other_key": "x"},
+            "not_a_table": "oops",
+        }
+    }
+    assert load_recipes(config) == {"good": "Do the thing."}
 
 
 def test_apply_config_to_environment_sets_escalation_vars():

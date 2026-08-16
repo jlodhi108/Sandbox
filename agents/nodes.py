@@ -242,17 +242,36 @@ def check_requires_resolvable(language: str, module: str) -> bool | None:
     return module.removeprefix("node:") in _NODE_BUILTIN_MODULES
 
 
+def _with_recipe(system_prompt: str, recipe_instruction: str | None) -> str:
+    """Append a recipe's extra guidance to a language handler's base
+    system prompt, if one is configured for this run (see
+    AgentState.recipe_instruction and config.load_recipes). Appended
+    rather than replacing the base prompt — the recipe narrows/steers
+    WHAT kind of modernization happens (e.g. "only convert callbacks to
+    async/await"), it doesn't need to restate the base rules every
+    language handler already enforces (single-function output, REQUIRES
+    markers, no markdown fences, etc.)."""
+    if not recipe_instruction:
+        return system_prompt
+    return (
+        f"{system_prompt}\n\n"
+        f"--- Additional guidance for this modernization run ---\n"
+        f"{recipe_instruction}"
+    )
+
+
 def refactorer_node(state: AgentState) -> AgentState:
     handler = get_handler_by_name(state["language"])
+    recipe_instruction = state.get("recipe_instruction")
 
     if state["iteration_count"] == 0:
         messages = [
-            SystemMessage(content=handler.refactor_system_prompt),
+            SystemMessage(content=_with_recipe(handler.refactor_system_prompt, recipe_instruction)),
             HumanMessage(content=state["original_code"]),
         ]
     else:
         messages = [
-            SystemMessage(content=handler.fix_system_prompt),
+            SystemMessage(content=_with_recipe(handler.fix_system_prompt, recipe_instruction)),
             HumanMessage(
                 content=(
                     f"Previous attempt:\n{state['modernized_code']}\n\n"

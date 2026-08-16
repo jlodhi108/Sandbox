@@ -134,6 +134,64 @@ def test_run_repo_refuses_interactive_with_concurrent_workers():
         main.run_repo("/fake/root", open_pr=False, max_iterations=5, workers=2, interactive=True)
 
 
+def test_run_repo_refuses_isolate_workers_without_concurrent_workers():
+    import main
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="--workers > 1"):
+        main.run_repo("/fake/root", open_pr=False, max_iterations=5, workers=1, isolate_workers=True)
+
+
+def test_run_repo_refuses_isolate_workers_on_non_git_directory():
+    import main
+    import pytest as _pytest
+    with tempfile.TemporaryDirectory() as root:
+        with _pytest.raises(ValueError, match="git repository"):
+            main.run_repo(root, open_pr=False, max_iterations=5, workers=2, isolate_workers=True)
+
+
+def test_run_file_in_worktree_copies_output_back_to_the_real_tree():
+    import subprocess
+    from main import _run_file_in_worktree
+
+    with tempfile.TemporaryDirectory() as root:
+        subprocess.run(["git", "init", "-q", root], check=True)
+        subprocess.run(["git", "-C", root, "config", "user.email", "t@example.com"], check=True)
+        subprocess.run(["git", "-C", root, "config", "user.name", "T"], check=True)
+        _touch(os.path.join(root, "calc.py"), "def add(a, b):\n    return a + b\n")
+        subprocess.run(["git", "-C", root, "add", "."], check=True)
+        subprocess.run(["git", "-C", root, "commit", "-q", "-m", "initial"], check=True)
+
+        def fake_run_file(file_path, open_pr, max_iterations, standalone_pr=True, sibling_sources=None,
+                           generate_regression_tests=False, interactive=False, recipe_instruction=None):
+            # Simulate run_file() writing its output INSIDE the worktree
+            # it was handed (file_path points there, not at root_dir).
+            output_path = file_path.replace("calc.py", "calc.modernized.py")
+            with open(output_path, "w") as f:
+                f.write("def add(a: int, b: int) -> int:\n    return a + b\n")
+            return {"file_path": file_path, "output_path": output_path, "chunks_succeeded": 1}
+
+        with patch("main.run_file", side_effect=fake_run_file):
+            stats = _run_file_in_worktree(
+                root, os.path.join(root, "calc.py"), open_pr=False, max_iterations=5,
+                sibling_sources=[], generate_regression_tests=False, recipe_instruction=None,
+            )
+
+        # file_path/output_path must be reported relative to the REAL
+        # tree, not the throwaway worktree, and the output must actually
+        # exist there (copied back, not left stranded in the worktree).
+        assert stats["file_path"] == os.path.join(root, "calc.py")
+        assert stats["output_path"] == os.path.join(root, "calc.modernized.py")
+        assert os.path.isfile(stats["output_path"])
+        with open(stats["output_path"]) as f:
+            assert "int" in f.read()
+
+        # The worktree itself must be cleaned up afterward.
+        listing = subprocess.run(
+            ["git", "-C", root, "worktree", "list"], capture_output=True, text=True,
+        ).stdout
+        assert listing.strip().count("\n") == 0  # only the main worktree line, no extra worktrees
+
+
 def test_discover_files_finds_supported_extensions():
     with tempfile.TemporaryDirectory() as root:
         _touch(os.path.join(root, "a.py"))
@@ -374,7 +432,7 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
     files = ["a.py", "b.py", "c.py"]
     delays = {"a.py": 0.05, "b.py": 0.0, "c.py": 0.0}
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False):
+    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False, interactive=False, recipe_instruction=None):
         time.sleep(delays[file_path])
         return {"file_path": file_path, "chunks_succeeded": 1}
 
@@ -387,7 +445,7 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
 def test_run_files_concurrently_isolates_one_file_erroring():
     files = ["good.py", "bad.py"]
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False):
+    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False, interactive=False, recipe_instruction=None):
         if file_path == "bad.py":
             raise RuntimeError("boom")
         return {"file_path": file_path, "chunks_succeeded": 1}

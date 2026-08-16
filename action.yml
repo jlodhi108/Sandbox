@@ -1,0 +1,148 @@
+name: "code-modernizer"
+description: >-
+  Automated code modernization: rewrites legacy code chunk-by-chunk with a
+  local LLM, verifying every rewrite in an isolated Docker sandbox before
+  accepting it. Runs entirely on the runner — no external API calls, no
+  secrets required except an optional GITHUB_TOKEN for --pr.
+author: "jlodhi108"
+
+# A COMPOSITE action, not a Docker-container action: this project's own
+# sandbox verification ALREADY shells out to the Docker daemon (see
+# sandbox/verifier.py) to run untrusted candidate code in isolated
+# containers. A Docker-container action would put THIS action itself
+# inside a container too, one level up from the sandbox containers it
+# needs to create as SIBLINGS on the runner's own Docker daemon —
+# reachable without nested Docker-in-Docker only via a docker.sock bind
+# mount, which is exactly the extra fragility a composite action (running
+# directly on the runner, alongside its own dockerd) avoids entirely.
+# GitHub-hosted runners ship Docker preinstalled and running, so no setup
+# step is needed for that half.
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install code-modernizer
+      shell: bash
+      run: |
+        cd "${{ github.action_path }}"
+        pip install -q -r requirements.txt
+
+    - name: Install Ollama and pull model
+      shell: bash
+      run: |
+        curl -fsSL https://ollama.com/install.sh | sh
+        ollama serve &
+        # Wait for the local server to actually accept connections before
+        # pulling — a bare `ollama serve &` needs a moment to bind its
+        # port, and `ollama pull` right after would race it.
+        for i in $(seq 1 30); do
+          curl -fsS http://127.0.0.1:11434/ >/dev/null 2>&1 && break
+          sleep 1
+        done
+        ollama pull "${{ inputs.model }}"
+
+    - name: Build sandbox image
+      shell: bash
+      run: |
+        cd "${{ github.action_path }}"
+        docker build -t sandbox-multi -f sandbox/sandbox-multi.Dockerfile sandbox/
+
+    - name: Run code-modernizer
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPO: ${{ github.repository }}
+        ESCALATION_MODEL: ${{ inputs.escalation-model }}
+      run: |
+        # Run with cwd = the TARGET repo's checkout (github.workspace), not
+        # this tool's own checkout (github.action_path) — config.py resolves
+        # ".modernizer.toml" relative to cwd, and recipes/escalation/sandbox
+        # settings are meant to be the TARGET repo's own choices, not this
+        # action's. main.py is still invoked by its ABSOLUTE path (not
+        # `python -m main`, which would add cwd — the target repo — to
+        # sys.path AHEAD of action_path, risking a same-named main.py in
+        # the target repo shadowing this tool's own); running a script by
+        # path puts only the SCRIPT's own directory on sys.path[0], so
+        # main.py's sibling imports (agents.*, languages.*, sandbox.*)
+        # still resolve correctly regardless of cwd.
+        cd "${{ github.workspace }}"
+        ARGS=(
+          "${{ inputs.path }}"
+          --max-iterations "${{ inputs.max-iterations }}"
+          --report "${{ inputs.report }}"
+          --report-html "${{ inputs.report-html }}"
+        )
+        if [ "${{ inputs.pr }}" = "true" ]; then
+          ARGS+=(--pr)
+        fi
+        if [ -n "${{ inputs.max-llm-calls }}" ]; then
+          ARGS+=(--max-llm-calls "${{ inputs.max-llm-calls }}")
+        fi
+        if [ -n "${{ inputs.recipe }}" ]; then
+          ARGS+=(--recipe "${{ inputs.recipe }}")
+        fi
+        if [ "${{ inputs.workers }}" != "1" ]; then
+          ARGS+=(--workers "${{ inputs.workers }}")
+        fi
+        python "${{ github.action_path }}/main.py" "${ARGS[@]}"
+
+inputs:
+  path:
+    description: "Path (relative to the checked-out workspace) to a file or directory to modernize."
+    required: true
+  model:
+    description: "Ollama model to pull and use for modernization."
+    required: false
+    default: "qwen2.5-coder:14b"
+  escalation-model:
+    description: "Optional stronger model to escalate to after repeated failures on the same chunk."
+    required: false
+    default: ""
+  pr:
+    description: "Open a GitHub PR for modernized files. Requires github-token."
+    required: false
+    default: "false"
+  github-token:
+    description: "Token used to open a PR when pr: true. Typically the workflow's secrets.GITHUB_TOKEN."
+    required: false
+    default: ""
+  max-iterations:
+    description: "Max fix-attempt loops per chunk."
+    required: false
+    default: "5"
+  max-llm-calls:
+    description: "Hard ceiling on total LLM calls for the run. Leave empty for unlimited."
+    required: false
+    default: ""
+  workers:
+    description: "Modernize this many files concurrently (repo mode only)."
+    required: false
+    default: "1"
+  recipe:
+    description: "Name of a [recipes.NAME] table in the target repo's .modernizer.toml to scope this run."
+    required: false
+    default: ""
+  report:
+    description: "Path (relative to the workspace) to write the JSON run report."
+    required: false
+    default: "modernizer-report.json"
+  report-html:
+    description: "Path (relative to the workspace) to write the human-readable HTML run report."
+    required: false
+    default: "modernizer-report.html"
+
+outputs:
+  report:
+    description: "Path to the JSON run report."
+    value: ${{ inputs.report }}
+  report-html:
+    description: "Path to the HTML run report."
+    value: ${{ inputs.report-html }}
+
+branding:
+  icon: "refresh-cw"
+  color: "blue"

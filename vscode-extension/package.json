@@ -1,0 +1,64 @@
+{
+  "name": "code-modernizer",
+  "displayName": "Code Modernizer",
+  "description": "Modernize legacy code chunk-by-chunk with a local LLM, verified in an isolated sandbox before anything is written — from inside VS Code.",
+  "version": "0.1.0",
+  "publisher": "jlodhi108",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeModernizer.planFile",
+        "title": "Code Modernizer: Plan Current File (no LLM/Docker calls)"
+      },
+      {
+        "command": "codeModernizer.modernizeFile",
+        "title": "Code Modernizer: Modernize Current File"
+      },
+      {
+        "command": "codeModernizer.modernizeWorkspace",
+        "title": "Code Modernizer: Modernize Workspace"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codeModernizer.modernizeFile",
+          "group": "1_modification",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "codeModernizer.planFile",
+          "group": "1_modification",
+          "when": "editorTextFocus"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Code Modernizer",
+      "properties": {
+        "codeModernizer.repoPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to your local code-modernizer checkout (the directory containing main.py). Required."
+        },
+        "codeModernizer.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter to run code-modernizer with — point this at code-modernizer's .venv (e.g. /path/to/code-modernizer/.venv/bin/python) so dependencies resolve."
+        },
+        "codeModernizer.extraArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra CLI flags appended to every run, e.g. [\"--recipe\", \"py2-to-py3\"]."
+        }
+      }
+    }
+  }
+}

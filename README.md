@@ -87,10 +87,15 @@ Key flags (see `python main.py --help` for the full list):
 
 | Flag | Description |
 |---|---|
+| `--plan` | Report scope and estimated LLM-call cost with zero LLM/Docker calls, then exit |
 | `--pr` | Open a GitHub PR for each modernized file |
 | `--max-iterations N` | Max fix-attempt loops per chunk (default 5) |
 | `--max-llm-calls N` | Hard ceiling on LLM calls for the run |
 | `--workers N` | Modernize N files concurrently in repo mode |
+| `--isolate-workers` | Each concurrent worker runs in its own `git worktree` checkout (requires `--workers > 1` and a git repo) |
+| `--recipe NAME` | Scope this run to a named `[recipes.NAME]` table in `.modernizer.toml` |
+| `--watch` | Run an initial full pass, then keep watching `path` and modernize only changed files, forever (Ctrl+C to stop) |
+| `--watch-interval N` | Seconds between change-detection polls in `--watch` mode (default 5) |
 | `--run-target-tests` | Run the target repo's own test suite as an extra gate |
 | `--generate-regression-tests` | Generate regression tests for modernized chunks |
 | `--interactive` | Pause and prompt for approval on flagged chunks |
@@ -104,6 +109,35 @@ Key flags (see `python main.py --help` for the full list):
 - **`.modernizer.toml`** — everything else: model selection, escalation,
   sandbox/isolation settings, autonomy thresholds, observability. See
   `.modernizer.toml.example` for every option and its rationale.
+
+## Running from VS Code
+
+[`vscode-extension/`](vscode-extension/) is a thin editor extension over
+this same CLI — commands to plan, modernize the current file (with a
+native diff view), or modernize the whole workspace, all streamed into
+an output panel. See [`vscode-extension/README.md`](vscode-extension/README.md)
+for setup; there's no marketplace listing yet, it runs from source.
+
+## Running as a GitHub Action
+
+`action.yml` at the repo root packages the same pipeline as a reusable
+composite GitHub Action — install Ollama, build the sandbox image, run
+the modernizer, all on the runner (GitHub-hosted runners ship Docker
+already running, so no extra setup is needed for that half). Use it in
+another repo's workflow:
+
+```yaml
+- uses: jlodhi108/Sandbox/code-modernizer@main
+  with:
+    path: src/
+    pr: "true"
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+See [`.github/workflows/modernize-example.yml.disabled`](.github/workflows/modernize-example.yml.disabled)
+for a complete example workflow (scheduled run + report artifact upload)
+— rename it to drop the `.disabled` suffix in your own repo to use it.
+Every CLI flag has a matching input; see `action.yml` for the full list.
 
 ## Running as an MCP server
 

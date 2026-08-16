@@ -5,8 +5,10 @@ from agents.nodes import (
     _extract_required_imports,
     _validate_single_chunk,
     _invoke_llm_with_retry,
+    _with_recipe,
     check_requires_resolvable,
     verifier_node,
+    refactorer_node,
 )
 from languages.python_lang import PythonHandler
 from languages.php_lang import PhpHandler
@@ -305,6 +307,55 @@ def test_verifier_node_skips_equivalence_check_when_no_baseline():
         }
         result = verifier_node(state)
         assert result["status"] == "success"
+
+
+def test_with_recipe_returns_base_prompt_unchanged_when_no_recipe():
+    assert _with_recipe("BASE PROMPT", None) == "BASE PROMPT"
+    assert _with_recipe("BASE PROMPT", "") == "BASE PROMPT"
+
+
+def test_with_recipe_appends_instruction_to_base_prompt():
+    result = _with_recipe("BASE PROMPT", "Only convert callbacks to async/await.")
+    assert result.startswith("BASE PROMPT")
+    assert "Only convert callbacks to async/await." in result
+
+
+def test_refactorer_node_includes_recipe_instruction_in_system_prompt():
+    state = {
+        "language": "python",
+        "iteration_count": 0,
+        "original_code": "def f(x):\n    return x + 1\n",
+        "recipe_instruction": "Only convert callback-style functions to async/await.",
+    }
+    mock_response = MagicMock()
+    mock_response.content = "def f(x):\n    return x + 1\n"
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    system_message = mock_llm.invoke.call_args[0][0][0]
+    assert "Only convert callback-style functions to async/await." in system_message.content
+
+
+def test_refactorer_node_omits_recipe_section_when_none_configured():
+    state = {
+        "language": "python",
+        "iteration_count": 0,
+        "original_code": "def f(x):\n    return x + 1\n",
+        "recipe_instruction": None,
+    }
+    mock_response = MagicMock()
+    mock_response.content = "def f(x):\n    return x + 1\n"
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    system_message = mock_llm.invoke.call_args[0][0][0]
+    assert "Additional guidance for this modernization run" not in system_message.content
 
 
 def test_invoke_llm_with_retry_recovers_from_transient_failure():

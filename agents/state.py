@@ -76,3 +76,14 @@ class AgentState(TypedDict):
     iteration_count: int
     status: str  # "pending" | "success" | "failed" | "awaiting_review"
     max_iterations: int
+    recipe_instruction: str | None  # extra guidance appended to the refactor/
+                                      # fix system prompts, e.g. "convert
+                                      # callback-style functions to async/await
+                                      # only — leave everything else as-is."
+                                      # None (the default) changes nothing
+                                      # about the prompt. Set once per run
+                                      # from .modernizer.toml's [recipes.<name>]
+                                      # via --recipe, not per-chunk — passed
+                                      # through state (not a module-level
+                                      # global) so concurrent --workers runs
+                                      # of DIFFERENT files can't race on it.

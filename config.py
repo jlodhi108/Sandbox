@@ -21,6 +21,25 @@ def load_config(path: str | None = None) -> dict:
         return tomllib.load(f)
 
 
+def load_recipes(config: dict) -> dict[str, str]:
+    """Named modernization recipes from .modernizer.toml's [recipes.<name>]
+    tables — {name: instruction}. Each recipe's `instruction` string is
+    appended to the language handler's base system prompt (see
+    agents/nodes.py:_with_recipe) to SCOPE what a run does, e.g. "only
+    convert callback-style functions to async/await, leave everything
+    else untouched" — without that, every chunk gets the same generic
+    'modernize this' prompt regardless of what the user actually wants
+    changed. A malformed entry (missing `instruction`) is skipped rather
+    than raising, so one bad recipe in the file doesn't break every run
+    that doesn't even use --recipe."""
+    recipes = config.get("recipes", {})
+    result = {}
+    for name, table in recipes.items():
+        if isinstance(table, dict) and isinstance(table.get("instruction"), str):
+            result[name] = table["instruction"]
+    return result
+
+
 def apply_config_to_environment(config: dict) -> None:
     """Push config values that other modules read from os.environ at
     IMPORT time (ESCALATION_MODEL, ESCALATION_THRESHOLD, REVIEWER_MODEL,

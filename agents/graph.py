@@ -144,6 +144,7 @@ def modernize(
     max_iterations: int = 5,
     sibling_sources: list[bytes] | None = None,
     interactive: bool = False,
+    recipe_instruction: str | None = None,
 ) -> AgentState:
     app = build_graph()
     original_code = full_source[chunk_start:chunk_end].decode("utf-8")
@@ -172,6 +173,7 @@ def modernize(
         "iteration_count": 0,
         "status": "pending",
         "max_iterations": max_iterations,
+        "recipe_instruction": recipe_instruction,
     }
     final_state = app.invoke(initial_state)
 

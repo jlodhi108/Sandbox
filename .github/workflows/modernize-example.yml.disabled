@@ -1,0 +1,40 @@
+# Example workflow for consuming code-modernizer as a GitHub Action.
+#
+# Renamed to modernize-example.yml.disabled (not .yml) so it doesn't run
+# in THIS repo's own CI — it's documentation for OTHER repos to copy,
+# not something code-modernizer runs against itself. To use it in your
+# own repo: copy this file to .github/workflows/modernize.yml (drop the
+# .disabled suffix) and adjust `path`/`schedule` as needed.
+name: modernize
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"  # weekly, Monday 03:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  modernize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run code-modernizer
+        uses: jlodhi108/Sandbox/code-modernizer@main
+        with:
+          path: src/
+          pr: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          max-llm-calls: "200"
+
+      - name: Upload run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modernizer-report
+          path: |
+            modernizer-report.json
+            modernizer-report.html

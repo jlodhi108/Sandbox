@@ -33,3 +33,25 @@ jobs:
       - run: pip install -r requirements.txt
       - run: docker build -t sandbox-multi -f sandbox/sandbox-multi.Dockerfile sandbox/
       - run: python sandbox/verifier.py
+
+  action-yaml-lint:
+    # Tier 3: action.yml gets committed by hand and never actually
+    # exercised by unit-tests/sandbox-smoke-test above — this catches a
+    # broken action.yml (bad YAML, a required input renamed but not
+    # updated everywhere) before someone else's workflow discovers it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q pyyaml
+      - run: |
+          python -c "
+          import yaml
+          with open('action.yml') as f:
+              d = yaml.safe_load(f)
+          assert d['runs']['using'] == 'composite'
+          assert set(d['inputs']) >= {'path', 'pr', 'github-token', 'max-iterations'}
+          print('action.yml OK:', d['name'])
+          "

@@ -1,11 +1,12 @@
 import argparse
 import difflib
 import os
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
-from config import load_config, apply_config_to_environment
+from config import load_config, apply_config_to_environment, load_recipes
 
 # Must run before importing agents.graph / sandbox.verifier — both read
 # environment variables (ESCALATION_MODEL, SANDBOX_RUNTIME) at import
@@ -190,10 +191,96 @@ def _resolve_interactive_review(final_state: dict) -> dict:
     return {**final_state, "status": "gave_up", "compiler_stderr": "Rejected during interactive review."}
 
 
+def _estimate_llm_calls_per_chunk(max_iterations: int) -> tuple[int, int]:
+    """Rough (min, max) LLM-call range for ONE chunk that ends up
+    actually needing modernization (already-modern chunks cost zero —
+    see handler.already_modern's fast path). Deliberately a coarse
+    estimate, not a simulation: --plan exists to answer "is this worth
+    running" cheaply (no LLM/Docker calls at all), not to predict the
+    exact bill.
+
+    min: succeeds on the FIRST attempt — costs BEST_OF_N_ON_FIRST_ATTEMPT
+    refactor calls (best-of-N always fires on that first attempt; see
+    agents/nodes.py:refactorer_node) + 1 risk-assessment call + 1
+    mutation-confidence call (both run once, post-success only — see
+    agents/graph.py:modernize). No probe-generation call counted in the
+    minimum: it's skipped whenever real call sites already cover
+    MAX_PROBES_PER_CHUNK, which the static estimate can't know in
+    advance either way, so this errs toward the cheaper case.
+
+    max: exhausts every retry (max_iterations - 1 additional single-
+    candidate attempts, since best-of-N only applies to the first) before
+    finally succeeding, PLUS one probe-generation call."""
+    from agents.nodes import BEST_OF_N_ON_FIRST_ATTEMPT
+    min_calls = BEST_OF_N_ON_FIRST_ATTEMPT + 2
+    max_calls = BEST_OF_N_ON_FIRST_ATTEMPT + max(0, max_iterations - 1) + 3
+    return min_calls, max_calls
+
+
+def plan_file(file_path: str, max_iterations: int) -> dict:
+    """Chunk `file_path` and report what a real run would face, WITHOUT
+    making any LLM or Docker call — pure tree-sitter parsing plus the
+    already-modern regex/heuristic check (see languages/base.py), both
+    fully local and instant. This is the entire point of --plan: let
+    someone see the scope and rough cost of a run before spending
+    anything on it."""
+    handler = get_handler(file_path)
+    with open(file_path, "rb") as f:
+        source = f.read()
+    chunks = handler.chunk(source)
+    already_modern = sum(1 for c in chunks if handler.already_modern(c.code))
+    to_modernize = len(chunks) - already_modern
+    min_per, max_per = _estimate_llm_calls_per_chunk(max_iterations)
+    return {
+        "file_path": file_path,
+        "language": handler.name,
+        "chunks_total": len(chunks),
+        "chunks_already_modern": already_modern,
+        "chunks_to_modernize": to_modernize,
+        "estimated_llm_calls_min": to_modernize * min_per,
+        "estimated_llm_calls_max": to_modernize * max_per,
+    }
+
+
+def plan_run(path: str, max_iterations: int) -> list[dict]:
+    """--plan entry point for both single-file and repo mode. Repo mode
+    reuses discover_files so the estimate matches exactly what a real
+    `run_repo` call would find (same .gitignore/extension filtering)."""
+    files = discover_files(path) if os.path.isdir(path) else [path]
+    return [plan_file(f, max_iterations) for f in files]
+
+
+def print_plan(plans: list[dict]) -> None:
+    total_chunks = sum(p["chunks_total"] for p in plans)
+    total_already_modern = sum(p["chunks_already_modern"] for p in plans)
+    total_to_modernize = sum(p["chunks_to_modernize"] for p in plans)
+    total_min = sum(p["estimated_llm_calls_min"] for p in plans)
+    total_max = sum(p["estimated_llm_calls_max"] for p in plans)
+
+    print(f"\n--plan: {len(plans)} file(s) scanned, no LLM/Docker calls made\n")
+    for p in plans:
+        print(
+            f"  [{p['language']}] {p['file_path']}: {p['chunks_total']} chunk(s) "
+            f"({p['chunks_already_modern']} already modern, {p['chunks_to_modernize']} to modernize) "
+            f"— est. {p['estimated_llm_calls_min']}-{p['estimated_llm_calls_max']} LLM calls"
+        )
+    print(
+        f"\nTotal: {total_chunks} chunk(s), {total_already_modern} already modern, "
+        f"{total_to_modernize} to modernize"
+    )
+    print(f"Estimated LLM calls for a real run: {total_min}-{total_max}")
+    print(
+        "(Range reflects best case: every chunk passes on its first attempt, vs. "
+        "worst case: every chunk exhausts --max-iterations before succeeding. "
+        "Actual sandbox/verification cost — Docker time, not LLM calls — isn't estimated here.)"
+    )
+
+
 def run_file(
     file_path: str, open_pr: bool, max_iterations: int,
     standalone_pr: bool = True, sibling_sources: list[bytes] | None = None,
     generate_regression_tests: bool = False, interactive: bool = False,
+    recipe_instruction: str | None = None,
 ) -> dict:
     """Modernize one file. Returns a stats dict (also the data source for
     --report) rather than just printing, so repo mode can aggregate
@@ -278,7 +365,7 @@ def run_file(
             final_state = modernize(
                 handler.name, working_source, chunk.start_byte, chunk.end_byte,
                 max_iterations=max_iterations, sibling_sources=sibling_sources,
-                interactive=interactive,
+                interactive=interactive, recipe_instruction=recipe_instruction,
             )
             if final_state["status"] == "awaiting_review":
                 final_state = _resolve_interactive_review(final_state)
@@ -543,9 +630,49 @@ def _read_all_file_contents(files: list[str]) -> dict[str, bytes]:
     return contents
 
 
+def _run_file_in_worktree(
+    root_dir: str, file_path: str, open_pr: bool, max_iterations: int, sibling_sources: list[bytes],
+    generate_regression_tests: bool, recipe_instruction: str | None,
+) -> dict:
+    """Same job as run_file(), but the actual read/chunk/verify/write
+    cycle runs against a dedicated git worktree checkout of root_dir
+    (see git_ops/worktree.py's module docstring for exactly what this
+    does and doesn't protect against) instead of the shared root_dir
+    directly. Any output file(s) run_file() produced inside the worktree
+    are copied back into root_dir before the worktree is torn down —
+    root_dir itself is never written to until that explicit copy-back,
+    and the worktree is always removed (success or failure) so a run
+    doesn't leak temp checkouts."""
+    from git_ops.worktree import create_worktree, remove_worktree
+
+    rel_path = os.path.relpath(file_path, root_dir)
+    worktree_path = create_worktree(root_dir)
+    try:
+        stats = run_file(
+            os.path.join(worktree_path, rel_path), open_pr, max_iterations,
+            standalone_pr=False, sibling_sources=sibling_sources,
+            generate_regression_tests=generate_regression_tests,
+            interactive=False, recipe_instruction=recipe_instruction,
+        )
+        # Report paths relative to the REAL tree, not the throwaway
+        # worktree — everything downstream (--report, the combined PR,
+        # --run-target-tests overlay) expects paths under root_dir.
+        stats["file_path"] = file_path
+        for path_key in ("output_path", "regression_test_path"):
+            wt_path = stats.get(path_key)
+            if wt_path and os.path.isfile(wt_path):
+                real_path = os.path.join(root_dir, os.path.relpath(wt_path, worktree_path))
+                shutil.copy2(wt_path, real_path)
+                stats[path_key] = real_path
+        return stats
+    finally:
+        remove_worktree(root_dir, worktree_path)
+
+
 def _run_files_concurrently(
     files: list[str], open_pr: bool, max_iterations: int, workers: int, file_contents: dict[str, bytes],
-    generate_regression_tests: bool = False,
+    generate_regression_tests: bool = False, recipe_instruction: str | None = None,
+    root_dir: str | None = None, isolate_workers: bool = False,
 ) -> list[dict]:
     """Run run_file() for independent files in parallel. Safe because
     files don't share state — only chunks WITHIN a single file have an
@@ -554,15 +681,28 @@ def _run_files_concurrently(
     local to one run_file() call. Results are reassembled in ORIGINAL
     file order (not completion order), so --report output stays
     deterministic across runs regardless of which file happened to
-    finish first."""
+    finish first.
+
+    isolate_workers routes each file through _run_file_in_worktree
+    instead of calling run_file() directly on the shared root_dir — see
+    git_ops/worktree.py's module docstring for what that buys and what
+    it doesn't (there's no existing race this fixes; it's forward-looking
+    isolation, opt-in because a worktree checkout per file isn't free)."""
     results: list[dict | None] = [None] * len(files)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_index = {}
         for i, file_path in enumerate(files):
             siblings = [content for fp, content in file_contents.items() if fp != file_path]
-            future = executor.submit(
-                run_file, file_path, open_pr, max_iterations, False, siblings, generate_regression_tests,
-            )
+            if isolate_workers:
+                future = executor.submit(
+                    _run_file_in_worktree, root_dir, file_path, open_pr, max_iterations, siblings,
+                    generate_regression_tests, recipe_instruction,
+                )
+            else:
+                future = executor.submit(
+                    run_file, file_path, open_pr, max_iterations, False, siblings, generate_regression_tests,
+                    False, recipe_instruction,
+                )
             future_to_index[future] = i
         for future in as_completed(future_to_index):
             i = future_to_index[future]
@@ -578,6 +718,7 @@ def _run_files_concurrently(
 def run_repo(
     root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1, run_target_tests: bool = False,
     generate_regression_tests: bool = False, interactive: bool = False,
+    recipe_instruction: str | None = None, isolate_workers: bool = False,
 ) -> list[dict]:
     global _last_target_test_result
     _last_target_test_result = None
@@ -589,6 +730,15 @@ def run_repo(
         # warning for concurrent mode, actually unusable. Refuse clearly
         # rather than let it silently misbehave.
         raise ValueError("--interactive is not supported with --workers > 1 (concurrent prompts would garble the terminal). Run with --workers 1.")
+    if isolate_workers and workers <= 1:
+        raise ValueError("--isolate-workers only makes sense with --workers > 1.")
+    if isolate_workers:
+        from git_ops.worktree import is_git_repo
+        if not is_git_repo(root_dir):
+            raise ValueError(
+                f"--isolate-workers requires {root_dir!r} to be a git repository "
+                f"(needs `git worktree` to isolate each worker's checkout)."
+            )
     files = discover_files(root_dir)
     print(f"Found {len(files)} modernizable file(s) under {root_dir}")
 
@@ -618,6 +768,7 @@ def run_repo(
         )
         all_stats = _run_files_concurrently(
             files, open_pr, max_iterations, workers, file_contents, generate_regression_tests,
+            recipe_instruction, root_dir, isolate_workers,
         )
     else:
         all_stats = []
@@ -641,7 +792,7 @@ def run_repo(
                     file_path, open_pr, max_iterations,
                     standalone_pr=False, sibling_sources=siblings,
                     generate_regression_tests=generate_regression_tests,
-                    interactive=interactive,
+                    interactive=interactive, recipe_instruction=recipe_instruction,
                 )
             except Exception as e:
                 print(f"ERROR processing {file_path}: {e}")
@@ -708,6 +859,86 @@ def run_repo(
                     s["pr_url"] = pr_url
 
     return all_stats
+
+
+def _scan_mtimes(root_dir: str) -> dict[str, float]:
+    """{file_path: mtime} for every modernizable file discover_files()
+    finds — the entire signal --watch uses to notice a change. Deliberately
+    mtime-based polling, not a filesystem-events library (inotify/FSEvents/
+    watchdog): this project already keeps its dependency list to what each
+    feature strictly needs (see requirements.txt's per-line comments), and
+    polling every few seconds is simple, has zero new dependencies, and
+    works identically on every OS — the tradeoff (a few seconds of latency
+    between an edit and this noticing it) is a fine price for that."""
+    return {f: os.path.getmtime(f) for f in discover_files(root_dir) if os.path.isfile(f)}
+
+
+def _diff_changed_files(old_mtimes: dict[str, float], new_mtimes: dict[str, float]) -> list[str]:
+    """Files that are new OR whose mtime moved since the last scan.
+    Deleted files (in old_mtimes but not new_mtimes) are silently dropped
+    from tracking — nothing to modernize about a file that's gone."""
+    return sorted(f for f, mtime in new_mtimes.items() if old_mtimes.get(f) != mtime)
+
+
+def watch_run(
+    root_dir: str, open_pr: bool, max_iterations: int,
+    generate_regression_tests: bool = False, recipe_instruction: str | None = None,
+    poll_interval_seconds: int = 5, initial_pass: bool = True,
+    _max_polls: int | None = None,
+) -> None:
+    """Long-running incremental mode: modernize root_dir once (unless
+    initial_pass=False), then poll for file changes and modernize ONLY
+    what changed, forever — the "strangler fig" / gradual-migration
+    pattern, where a team edits legacy code over time and wants each
+    change swept up as it happens rather than re-running a full repo
+    scan by hand. Each changed file goes through run_file() exactly like
+    single-file mode (already-modern chunks are skipped for free by
+    handler.already_modern(), so re-scanning an unrelated file that
+    happened to have ITS mtime bumped by an unrelated git operation
+    costs nothing beyond the chunking pass).
+
+    Runs until Ctrl+C (KeyboardInterrupt), printed as a clean stop rather
+    than a traceback. _max_polls is test-only plumbing — bounds the loop
+    to a finite number of poll cycles so a test doesn't hang forever;
+    real callers (main()) never pass it, so real usage is unaffected."""
+    print(
+        f"--watch: watching {root_dir} for changes, polling every "
+        f"{poll_interval_seconds}s. Press Ctrl+C to stop."
+    )
+
+    if initial_pass:
+        print("\n--watch: running an initial full pass before watching for changes...")
+        run_repo(root_dir, open_pr, max_iterations, workers=1,
+                 generate_regression_tests=generate_regression_tests,
+                 recipe_instruction=recipe_instruction)
+
+    known_mtimes = _scan_mtimes(root_dir)
+    polls = 0
+    try:
+        while _max_polls is None or polls < _max_polls:
+            time.sleep(poll_interval_seconds)
+            polls += 1
+            current_mtimes = _scan_mtimes(root_dir)
+            changed = _diff_changed_files(known_mtimes, current_mtimes)
+            known_mtimes = current_mtimes
+            if not changed:
+                continue
+
+            print(f"\n--watch: {len(changed)} changed file(s) detected: {', '.join(changed)}")
+            file_contents = _read_all_file_contents(list(current_mtimes.keys()))
+            for file_path in changed:
+                siblings = [content for fp, content in file_contents.items() if fp != file_path]
+                try:
+                    run_file(
+                        file_path, open_pr, max_iterations,
+                        standalone_pr=open_pr, sibling_sources=siblings,
+                        generate_regression_tests=generate_regression_tests,
+                        recipe_instruction=recipe_instruction,
+                    )
+                except Exception as e:
+                    print(f"--watch: ERROR processing {file_path}: {e}")
+    except KeyboardInterrupt:
+        print("\n--watch: stopped.")
 
 
 def _open_combined_pr(root_dir: str, all_stats: list[dict]) -> str | None:
@@ -930,6 +1161,13 @@ def main():
     parser = argparse.ArgumentParser(description="Automated Code Modernization Engine")
     parser.add_argument("path", help="Path to a legacy source file, OR a directory to modernize recursively")
     parser.add_argument("--pr", action="store_true", help="Open a GitHub PR for each modernized file")
+    parser.add_argument(
+        "--plan", action="store_true",
+        help="Chunk the target and report scope + estimated LLM-call cost, WITHOUT calling the "
+             "LLM or Docker sandbox at all — see what a real run would face before spending "
+             "anything on it. Exits immediately after printing; every other flag except "
+             "--max-iterations (which affects the cost estimate) and --report is ignored.",
+    )
     parser.add_argument("--max-iterations", type=int, default=_settings.get("max_iterations", 5))
     parser.add_argument(
         "--report", metavar="PATH", default=_settings.get("report"),
@@ -946,6 +1184,15 @@ def main():
         help="Process this many files concurrently in repo mode (default 1 = sequential). "
              "Each worker runs its own Docker containers and LLM calls — mind your machine's "
              "CPU/memory and Ollama's own concurrency limits before raising this.",
+    )
+    parser.add_argument(
+        "--isolate-workers", action="store_true", default=_settings.get("isolate_workers", False),
+        help="Requires --workers > 1 and root_dir to be a git repository. Each concurrent "
+             "worker reads/writes inside its own `git worktree` checkout (isolated from every "
+             "other worker and from a human editing the same tree mid-run) instead of the "
+             "shared directory directly; output files are copied back afterward. Off by "
+             "default — a worktree checkout per file isn't free, and nothing in the current "
+             "pipeline actually races without it (see git_ops/worktree.py's module docstring).",
     )
     parser.add_argument(
         "--max-llm-calls", type=int, default=_settings.get("max_llm_calls_per_run"),
@@ -986,7 +1233,64 @@ def main():
              "any other failed chunk (not written to output). Not supported with --workers > 1 "
              "(concurrent prompts would garble the terminal).",
     )
+    parser.add_argument(
+        "--recipe", metavar="NAME", default=_settings.get("recipe"),
+        help="Name of a [recipes.NAME] table in .modernizer.toml to scope this run — its "
+             "`instruction` string is appended to the base system prompt for every chunk, e.g. "
+             "'only convert callback-style functions to async/await, leave everything else "
+             "as-is.' Without this, every chunk gets the same generic 'modernize this' prompt.",
+    )
+    parser.add_argument(
+        "--watch", action="store_true",
+        help="Long-running incremental mode: run an initial full pass over `path` (a "
+             "directory), then poll for file changes and modernize ONLY what changed, "
+             "forever — for gradual/'strangler fig' migration where you want each edit "
+             "swept up as it happens. Runs until Ctrl+C. Not compatible with --plan.",
+    )
+    parser.add_argument(
+        "--watch-interval", type=int, default=_settings.get("watch_interval_seconds", 5),
+        help="Seconds between change-detection polls in --watch mode (default 5).",
+    )
     args = parser.parse_args()
+
+    _recipe_instruction = None
+    if args.recipe:
+        _recipes = load_recipes(_config)
+        if args.recipe not in _recipes:
+            parser.error(
+                f"--recipe '{args.recipe}' is not defined — add a [recipes.{args.recipe}] "
+                f"table with an `instruction` string to .modernizer.toml. "
+                f"Available: {', '.join(sorted(_recipes)) or '(none defined)'}"
+            )
+        _recipe_instruction = _recipes[args.recipe]
+
+    if args.plan and args.watch:
+        parser.error("--plan and --watch are not compatible — --plan makes one static estimate, --watch runs forever.")
+
+    if args.plan:
+        # Deliberately short-circuits before touching llm_budget, Docker,
+        # or any of the run_file/run_repo machinery below — --plan's
+        # entire point is a zero-cost, zero-side-effect look at scope.
+        plans = plan_run(args.path, args.max_iterations)
+        print_plan(plans)
+        if args.report:
+            import json
+            with open(args.report, "w") as f:
+                json.dump({"mode": "plan", "plans": plans}, f, indent=2)
+            print(f"\nWrote plan report to {args.report}")
+        return
+
+    if args.watch:
+        if not os.path.isdir(args.path):
+            parser.error("--watch requires `path` to be a directory (it watches for file changes over time).")
+        llm_budget.reset(max_calls=args.max_llm_calls)
+        watch_run(
+            args.path, args.pr, args.max_iterations,
+            generate_regression_tests=args.generate_regression_tests,
+            recipe_instruction=_recipe_instruction,
+            poll_interval_seconds=args.watch_interval,
+        )
+        return
 
     if args.interactive and args.workers > 1:
         parser.error("--interactive is not supported with --workers > 1 (concurrent prompts would garble the terminal)")
@@ -1001,13 +1305,14 @@ def main():
         results = run_repo(
             args.path, args.pr, args.max_iterations, args.workers,
             args.run_target_tests, args.generate_regression_tests, args.interactive,
+            recipe_instruction=_recipe_instruction, isolate_workers=args.isolate_workers,
         )
         mode = "repo"
     else:
         results = [run_file(
             args.path, args.pr, args.max_iterations,
             generate_regression_tests=args.generate_regression_tests,
-            interactive=args.interactive,
+            interactive=args.interactive, recipe_instruction=_recipe_instruction,
         )]
         mode = "file"
 
