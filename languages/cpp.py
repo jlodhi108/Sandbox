@@ -1,8 +1,16 @@
+import re
 import tree_sitter_cpp as tscpp
 from tree_sitter import Language
 
 from languages.base import LanguageHandler, CodeChunk
 from chunker.cpp_chunker import parse_chunks
+
+# \bnew\b / \bdelete\b (not \bnew\s / \bdelete\s) so this also matches
+# array forms with no space before the bracket — `delete[] arr;` has no
+# whitespace between "delete" and "[", which a \s-based check misses
+# entirely (confirmed by testing against legacy.cpp's free_array, which
+# a \s version incorrectly flagged as "already modern").
+_LEGACY_MARKERS_RE = re.compile(r"\bnew\b|\bdelete\b|\bmalloc\s*\(|\bfree\s*\(|\bNULL\b")
 
 
 class CppHandler(LanguageHandler):
@@ -25,6 +33,13 @@ class CppHandler(LanguageHandler):
 
     def has_import(self, source_text: str, module: str) -> bool:
         return f"#include <{module}>" in source_text
+
+    def already_modern(self, code: str) -> bool:
+        # No raw new/delete/malloc/free/NULL — the exact anti-patterns
+        # this project's refactor prompt targets. Absence doesn't prove
+        # the function is idiomatic C++20, just that it isn't showing the
+        # specific legacy markers we know how to fix.
+        return _LEGACY_MARKERS_RE.search(code) is None
 
     @property
     def refactor_system_prompt(self) -> str:

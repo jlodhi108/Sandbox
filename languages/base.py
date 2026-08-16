@@ -31,6 +31,18 @@ class LanguageHandler(ABC):
     # have their own wrapper if they need one.
     parse_wrapper_prefix: str = ""
 
+    # Whether a small "call this function and print the result" probe
+    # snippet can be safely appended at the end of the file and just run.
+    # True for languages where top-level statements execute directly
+    # (Python/JS/TS/PHP). False for languages with a single required
+    # entry point (C++'s int main(), Java's public static void main) —
+    # splicing an arbitrary extra call in safely would mean parsing INTO
+    # the existing entry point rather than just appending, which is a
+    # meaningfully riskier operation than anything else this project
+    # does today. Left as a known scope boundary rather than attempted
+    # under time pressure.
+    supports_function_probe: bool = False
+
     def chunk(self, source: bytes) -> list[CodeChunk]:
         parser = Parser(self.ts_language)
         tree = parser.parse(source)
@@ -81,6 +93,18 @@ class LanguageHandler(ABC):
 
     def has_import(self, source_text: str, module: str) -> bool:
         return self.import_statement(module).strip() in source_text
+
+    def already_modern(self, code: str) -> bool:
+        """Cheap heuristic: does this chunk show none of the obvious
+        legacy anti-patterns for this language? Default: never skip
+        (conservative — a language with no override always gets sent to
+        the LLM). This is deliberately a "does it show anti-patterns"
+        check, not a "does it show modern patterns" check — the latter
+        risks false positives on perfectly ordinary code that just
+        doesn't happen to use every modern idiom yet. Saves an LLM call
+        (and the risk of the model 'fixing' code that isn't broken) on
+        chunks that plainly don't need it."""
+        return False
 
     def build_candidate(
         self,

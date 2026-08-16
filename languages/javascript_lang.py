@@ -1,8 +1,27 @@
+import re
 import tree_sitter_javascript as tsjs
 import tree_sitter_typescript as tsts
 from tree_sitter import Language
 
 from languages.base import LanguageHandler
+
+# \bvar\b (word boundary) so this doesn't false-match "variable", "avatar",
+# etc. — one of the anti-patterns this project's refactor prompt targets.
+_VAR_KEYWORD_RE = re.compile(r"\bvar\b")
+
+
+def _js_already_modern(code: str) -> bool:
+    # "No var" alone is too weak: a plain `function foo() {...}` with no
+    # var inside its OWN body still isn't "modern" — arrow-function-first
+    # is the actual target here, and that check requires knowing the
+    # function is written in `const x = (...) => ...` form already, not
+    # just that it avoids one anti-pattern. Confirmed by testing against
+    # legacy.js directly: an absence-only check flagged BOTH sample
+    # functions as "already modern" even though we'd already demonstrated
+    # both benefit from arrow-function conversion.
+    stripped = code.lstrip()
+    already_arrow_style = stripped.startswith(("const ", "let "))
+    return already_arrow_style and _VAR_KEYWORD_RE.search(code) is None
 
 _QUERY_SRC = """
 (function_declaration) @function
@@ -54,11 +73,15 @@ class JavaScriptHandler(LanguageHandler):
     name = "javascript"
     extensions = (".js",)
     sandbox_filename = "main.js"
+    supports_function_probe = True
     ts_language = Language(tsjs.language())
     query_src = _QUERY_SRC
 
     def run_command(self) -> str:
         return "node main.js"
+
+    def already_modern(self, code: str) -> bool:
+        return _js_already_modern(code)
 
     @property
     def refactor_system_prompt(self) -> str:
@@ -73,11 +96,15 @@ class TypeScriptHandler(LanguageHandler):
     name = "typescript"
     extensions = (".ts",)
     sandbox_filename = "main.ts"
+    supports_function_probe = True
     ts_language = Language(tsts.language_typescript())
     query_src = _QUERY_SRC
 
     def run_command(self) -> str:
         return "npx tsc main.ts --target ES2020 --module commonjs --outDir out --skipLibCheck && node out/main.js"
+
+    def already_modern(self, code: str) -> bool:
+        return _js_already_modern(code)
 
     @property
     def refactor_system_prompt(self) -> str:

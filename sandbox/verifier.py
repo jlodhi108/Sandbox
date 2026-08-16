@@ -65,15 +65,24 @@ def verify(
 
             try:
                 result = container.wait(timeout=timeout)
-                logs = container.logs().decode("utf-8", errors="replace")
+                # Combined stdout+stderr for error feedback to the model —
+                # compiler errors land on either stream depending on the
+                # tool, so mixing them is what we want there. `stdout_only`
+                # is separate and used for behavioral-equivalence checks,
+                # where mixing in stderr noise (e.g. -Wall warnings that
+                # can legitimately differ between two working versions)
+                # would cause false-positive "output changed" mismatches.
+                combined_logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+                stdout_only = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
                 exit_code = result["StatusCode"]
             except Exception:
                 container.kill()
-                return {"status": "failed", "stderr": "Execution timed out", "exit_code": -1}
+                return {"status": "failed", "stderr": "Execution timed out", "stdout": "", "exit_code": -1}
 
             return {
                 "status": "success" if exit_code == 0 else "failed",
-                "stderr": logs,
+                "stderr": combined_logs,
+                "stdout": stdout_only,
                 "exit_code": exit_code,
             }
         finally:

@@ -1,13 +1,20 @@
+import re
 import tree_sitter_php as tsphp
 from tree_sitter import Language
 
 from languages.base import LanguageHandler
+
+# A return-type declaration on the signature — `): string {` — is a
+# positive signal the function has already had PHP 8 type hints applied,
+# the primary modernization target for this handler's prompt.
+_RETURN_TYPE_RE = re.compile(r"\)\s*:\s*\??[\w\\]+\s*\{")
 
 
 class PhpHandler(LanguageHandler):
     name = "php"
     extensions = (".php",)
     sandbox_filename = "main.php"
+    supports_function_probe = True
     ts_language = Language(tsphp.language_php())
     query_src = """
     (function_definition) @function
@@ -25,6 +32,9 @@ class PhpHandler(LanguageHandler):
 
     def has_import(self, source_text: str, module: str) -> bool:
         return f"use {module};" in source_text
+
+    def already_modern(self, code: str) -> bool:
+        return _RETURN_TYPE_RE.search(code) is not None
 
     @property
     def refactor_system_prompt(self) -> str:

@@ -3,11 +3,20 @@ from tree_sitter import Language
 
 from languages.base import LanguageHandler
 
+# %-formatting, .format(), or old os.path usage — the exact anti-patterns
+# this project's refactor prompt targets. Plain substrings, not regex:
+# false negatives (missing a legacy pattern) just mean "send to the LLM
+# anyway," the same as today's behavior — safe. False positives (skipping
+# something that IS legacy) are the risk to avoid, so keep this simple
+# and conservative rather than clever.
+_LEGACY_MARKERS = ("%s", ".format(", "os.path.")
+
 
 class PythonHandler(LanguageHandler):
     name = "python"
     extensions = (".py",)
     sandbox_filename = "main.py"
+    supports_function_probe = True
     ts_language = Language(tspy.language())
     # function_definition covers both free functions and methods (methods
     # are function_definition nodes nested inside class_definition) — we
@@ -25,6 +34,9 @@ class PythonHandler(LanguageHandler):
 
     def has_import(self, source_text: str, module: str) -> bool:
         return f"import {module}" in source_text
+
+    def already_modern(self, code: str) -> bool:
+        return not any(marker in code for marker in _LEGACY_MARKERS)
 
     @property
     def refactor_system_prompt(self) -> str:

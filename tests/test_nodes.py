@@ -1,9 +1,10 @@
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from agents.nodes import (
     _strip_markdown_fence,
     _extract_required_imports,
     _validate_single_chunk,
+    _invoke_llm_with_retry,
     verifier_node,
 )
 from languages.python_lang import PythonHandler
@@ -169,3 +170,250 @@ def test_validate_single_chunk_accepts_php_without_open_tag():
     handler = PhpHandler()
     code = "function greet(string $name): string {\n    return \"Hello, \" . $name . \"!\";\n}"
     assert _validate_single_chunk(handler, code) is None
+
+
+def test_verifier_node_accepts_matching_baseline_stdout():
+    state = {
+        "language": "cpp",
+        "full_source": b"int main() { return 0; }\n",
+        "chunk_start": 0,
+        "chunk_end": 25,
+        "modernized_code": "int main() { return 0; }",
+        "required_imports": [],
+        "baseline_stdout": "same output\n",
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify:
+        mock_verify.return_value = {
+            "status": "success", "stderr": "", "stdout": "same output\n", "exit_code": 0,
+        }
+        result = verifier_node(state)
+        assert result["status"] == "success"
+
+
+def test_verifier_node_rejects_output_that_differs_from_baseline():
+    # Reproduces the real failure class: something that compiles and exits
+    # 0 but silently changed the program's behavior (e.g. the C++
+    # .release() hack, or the duplicate-def corruption) — a bare
+    # compile+run check would call this "success".
+    state = {
+        "language": "cpp",
+        "full_source": b"int main() { return 0; }\n",
+        "chunk_start": 0,
+        "chunk_end": 25,
+        "modernized_code": "int main() { return 0; }",
+        "required_imports": [],
+        "baseline_stdout": "expected output\n",
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify:
+        mock_verify.return_value = {
+            "status": "success", "stderr": "", "stdout": "DIFFERENT output\n", "exit_code": 0,
+        }
+        result = verifier_node(state)
+        assert result["status"] == "failed"
+        assert "changes the program's output" in result["compiler_stderr"]
+
+
+def test_verifier_node_skips_equivalence_check_when_no_baseline():
+    # baseline_stdout is None when the ORIGINAL file didn't run cleanly —
+    # nothing to compare against, so a successful modernization should
+    # still be accepted rather than blocked on an impossible check.
+    state = {
+        "language": "cpp",
+        "full_source": b"int main() { return 0; }\n",
+        "chunk_start": 0,
+        "chunk_end": 25,
+        "modernized_code": "int main() { return 0; }",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify:
+        mock_verify.return_value = {
+            "status": "success", "stderr": "", "stdout": "whatever\n", "exit_code": 0,
+        }
+        result = verifier_node(state)
+        assert result["status"] == "success"
+
+
+def test_invoke_llm_with_retry_recovers_from_transient_failure():
+    import httpx
+
+    call_count = {"n": 0}
+
+    def flaky_invoke(messages):
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            raise httpx.ConnectError("connection refused")
+        return "ok response"
+
+    mock_llm = MagicMock()
+    mock_llm.invoke.side_effect = flaky_invoke
+    with patch("agents.nodes.time.sleep") as mock_sleep:
+        result = _invoke_llm_with_retry(mock_llm, [])
+        assert result == "ok response"
+        assert call_count["n"] == 2
+        mock_sleep.assert_called_once()
+
+
+def test_invoke_llm_with_retry_gives_up_after_max_attempts():
+    import httpx
+
+    mock_llm = MagicMock()
+    mock_llm.invoke.side_effect = httpx.ConnectError("connection refused")
+    with patch("agents.nodes.time.sleep"):
+        try:
+            _invoke_llm_with_retry(mock_llm, [])
+            assert False, "expected ConnectionError"
+        except ConnectionError as e:
+            assert "ollama serve" in str(e)
+        assert mock_llm.invoke.call_count == 3
+
+
+def test_select_llm_uses_default_when_no_escalation_configured():
+    import agents.nodes as nodes_module
+    with patch.object(nodes_module, "escalation_llm", None):
+        selected, used = nodes_module._select_llm(iteration_count=10)
+        assert selected is nodes_module.llm
+        assert used is False
+
+
+def test_select_llm_stays_default_below_threshold():
+    import agents.nodes as nodes_module
+    fake_escalation = MagicMock()
+    with patch.object(nodes_module, "escalation_llm", fake_escalation), \
+         patch.object(nodes_module, "ESCALATION_THRESHOLD", 3):
+        selected, used = nodes_module._select_llm(iteration_count=2)
+        assert selected is nodes_module.llm
+        assert used is False
+
+
+def test_select_llm_escalates_at_threshold():
+    import agents.nodes as nodes_module
+    fake_escalation = MagicMock()
+    with patch.object(nodes_module, "escalation_llm", fake_escalation), \
+         patch.object(nodes_module, "ESCALATION_THRESHOLD", 3):
+        selected, used = nodes_module._select_llm(iteration_count=3)
+        assert selected is fake_escalation
+        assert used is True
+
+
+def test_assess_risk_parses_yes():
+    from agents.nodes import assess_risk
+
+    mock_response = MagicMock()
+    mock_response.content = "RISK: yes\nThis function writes to a file."
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        risk_flag, reason = assess_risk("def save(x):\n    open('f').write(x)")
+        assert risk_flag is True
+        assert "writes to a file" in reason
+
+
+def test_assess_risk_parses_no():
+    from agents.nodes import assess_risk
+
+    mock_response = MagicMock()
+    mock_response.content = "RISK: no\nPure function, no side effects."
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        risk_flag, reason = assess_risk("def add(a, b):\n    return a + b")
+        assert risk_flag is False
+        assert "Pure function" in reason
+
+
+def test_assess_risk_defaults_to_not_flagged_on_unparseable_response():
+    # If the model doesn't follow the RISK: yes/no format, fail safe by
+    # not blocking the pipeline on an unparseable response rather than
+    # crashing — the structural/behavioral checks already did the real
+    # verification work; this is a best-effort second opinion on top.
+    from agents.nodes import assess_risk
+
+    mock_response = MagicMock()
+    mock_response.content = "I'm not sure, this seems fine I guess?"
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        risk_flag, reason = assess_risk("def add(a, b):\n    return a + b")
+        assert risk_flag is False
+
+
+def test_generate_probe_returns_snippet():
+    from agents.nodes import generate_probe
+
+    mock_response = MagicMock()
+    mock_response.content = "print(add(2, 3))"
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        probe = generate_probe("python", "def add(a, b):\n    return a + b")
+        assert probe == "print(add(2, 3))"
+
+
+def test_generate_probe_returns_none_on_skip():
+    from agents.nodes import generate_probe
+
+    mock_response = MagicMock()
+    mock_response.content = "PROBE: SKIP"
+    with patch("agents.nodes.llm") as mock_llm:
+        mock_llm.invoke.return_value = mock_response
+        probe = generate_probe("python", "def connect(db_handle):\n    ...")
+        assert probe is None
+
+
+def test_verifier_node_rejects_probe_output_mismatch():
+    # The whole-file baseline wouldn't catch this at all if main() never
+    # calls this function — the probe is the only thing that can.
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probe_snippet": "print(add(2, 3))",
+        "probe_baseline_stdout": "5\n",
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify:
+        # first call: the whole-file check (success, empty file has no output)
+        # second call: the probe check (returns WRONG result)
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},
+            {"status": "success", "stderr": "", "stdout": "99\n", "exit_code": 0},
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "failed"
+        assert "different result" in result["compiler_stderr"]
+
+
+def test_verifier_node_accepts_matching_probe_output():
+    state = {
+        "language": "python",
+        "full_source": b"def add(a, b):\n    return a + b\n",
+        "chunk_start": 0,
+        "chunk_end": 32,
+        "modernized_code": "def add(a, b):\n    return a + b",
+        "required_imports": [],
+        "baseline_stdout": None,
+        "probe_snippet": "print(add(2, 3))",
+        "probe_baseline_stdout": "5\n",
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify:
+        mock_verify.side_effect = [
+            {"status": "success", "stderr": "", "stdout": "", "exit_code": 0},
+            {"status": "success", "stderr": "", "stdout": "5\n", "exit_code": 0},
+        ]
+        result = verifier_node(state)
+        assert result["status"] == "success"
