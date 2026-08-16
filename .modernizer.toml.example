@@ -1,0 +1,19 @@
+# Copy to .modernizer.toml and edit. Every setting here is optional —
+# omit anything you want to leave at its default, or override via CLI
+# flag / env var (those always win over this file).
+#
+# Do NOT put GITHUB_TOKEN or any other secret in this file — it's meant
+# to be committed alongside the code it configures. Secrets stay in
+# .env or the shell environment.
+
+[settings]
+max_iterations = 5
+workers = 1
+# report = "modernizer-report.json"
+
+[escalation]
+# model = "qwen2.5-coder:32b"
+# threshold = 3
+
+[github]
+# repo = "owner/repo"
