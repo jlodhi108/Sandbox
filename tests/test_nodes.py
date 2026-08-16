@@ -497,6 +497,74 @@ def test_refactorer_node_omits_type_definitions_block_when_none():
     assert "Full definitions of type" not in human_message.content
 
 
+def test_format_exemplar_block_returns_empty_string_when_none():
+    from agents.nodes import _format_exemplar_block
+
+    assert _format_exemplar_block(None, None) == ""
+    assert _format_exemplar_block("def f(a, b): return a+b", None) == ""
+    assert _format_exemplar_block(None, "def f(a, b): return a+b") == ""
+
+
+def test_format_exemplar_block_includes_before_and_after():
+    from agents.nodes import _format_exemplar_block
+
+    block = _format_exemplar_block("def f(a, b): return a+b", "def f(a: int, b: int) -> int: return a+b")
+    assert "def f(a, b): return a+b" in block
+    assert "def f(a: int, b: int) -> int: return a+b" in block
+    assert "already successfully modernized" in block.lower()
+
+
+def test_refactorer_node_includes_exemplar_on_first_attempt():
+    state = {
+        "language": "python",
+        "iteration_count": 0,
+        "original_code": "def g(x, y):\n    return x + y\n",
+        "recipe_instruction": None,
+        "context_signatures": [],
+        "referenced_type_definitions": [],
+        "exemplar_original": "def f(a, b): return a+b",
+        "exemplar_modernized": "def f(a: int, b: int) -> int: return a+b",
+    }
+    mock_response = MagicMock()
+    mock_response.content = state["original_code"]
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes._diversity_llm") as mock_diversity:
+        mock_llm.invoke.return_value = mock_response
+        mock_diversity.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    human_message = mock_llm.invoke.call_args[0][0][1]
+    assert "def f(a, b): return a+b" in human_message.content
+    assert "def f(a: int, b: int) -> int: return a+b" in human_message.content
+
+
+def test_refactorer_node_omits_exemplar_on_retry():
+    # Real compiler/behavioral error feedback on retry is more directly
+    # useful than a generic worked example — the exemplar is first-
+    # attempt-only by design.
+    state = {
+        "language": "python",
+        "iteration_count": 1,
+        "original_code": "def g(x, y):\n    return x + y\n",
+        "modernized_code": "def g(x, y):\n    return x - y\n",
+        "compiler_stderr": "wrong output",
+        "recipe_instruction": None,
+        "context_signatures": [],
+        "referenced_type_definitions": [],
+        "exemplar_original": "def f(a, b): return a+b",
+        "exemplar_modernized": "def f(a: int, b: int) -> int: return a+b",
+    }
+    mock_response = MagicMock()
+    mock_response.content = state["original_code"]
+    mock_response.usage_metadata = None
+    with patch("agents.nodes.llm") as mock_llm, patch("agents.nodes.escalation_llm", None):
+        mock_llm.invoke.return_value = mock_response
+        refactorer_node(state)
+
+    human_message = mock_llm.invoke.call_args[0][0][1]
+    assert "def f(a, b): return a+b" not in human_message.content
+
+
 def test_refactorer_node_uses_deterministic_rule_without_calling_llm():
     state = {
         "language": "javascript",

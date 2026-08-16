@@ -149,6 +149,34 @@ def test_run_repo_refuses_isolate_workers_on_non_git_directory():
             main.run_repo(root, open_pr=False, max_iterations=5, workers=2, isolate_workers=True)
 
 
+def test_run_repo_refuses_staged_only_on_non_git_directory():
+    import main
+    import pytest as _pytest
+    with tempfile.TemporaryDirectory() as root:
+        with _pytest.raises(ValueError, match="git repository"):
+            main.run_repo(root, open_pr=False, max_iterations=5, staged_only=True)
+
+
+def test_run_repo_staged_only_discovers_only_staged_files():
+    import subprocess
+    import main
+
+    with tempfile.TemporaryDirectory() as root:
+        subprocess.run(["git", "init", "-q", root], check=True)
+        subprocess.run(["git", "-C", root, "config", "user.email", "t@example.com"], check=True)
+        subprocess.run(["git", "-C", root, "config", "user.name", "T"], check=True)
+        _touch(os.path.join(root, "staged.py"), "def f(x):\n    return '%s' % x\n")
+        _touch(os.path.join(root, "unstaged.py"), "def g(x):\n    return '%s' % x\n")
+        subprocess.run(["git", "-C", root, "add", "staged.py"], check=True)
+
+        with patch("main.run_file") as mock_run_file:
+            mock_run_file.return_value = {"file_path": "staged.py", "chunks_succeeded": 0}
+            main.run_repo(root, open_pr=False, max_iterations=5, staged_only=True)
+
+        processed_paths = [call.args[0] for call in mock_run_file.call_args_list]
+        assert processed_paths == [os.path.join(root, "staged.py")]
+
+
 def test_run_file_in_worktree_copies_output_back_to_the_real_tree():
     import subprocess
     from main import _run_file_in_worktree
@@ -614,3 +642,33 @@ def test_run_file_characterize_off_by_default():
             stats = main.run_file(file_path, open_pr=False, max_iterations=5)
 
     assert stats["characterization_test_path"] is None
+
+
+def test_run_file_computes_correct_start_line_for_security_flagged_chunk():
+    # security_flagged's start_line must be the REAL file's line number
+    # where the chunk begins, not byte 0 — sarif_report.py depends on
+    # this to report accurate line numbers.
+    import main
+
+    with tempfile.TemporaryDirectory() as root:
+        file_path = os.path.join(root, "calc.py")
+        # 3 blank-ish leading lines before the flagged function, so its
+        # real start line is 4, not 1.
+        _touch(file_path, "# comment 1\n# comment 2\n# comment 3\n\ndef greet(name):\n    return '%s' % name\n")
+
+        fake_state = {
+            "status": "success", "iteration_count": 1,
+            "modernized_code": "def greet(name):\n    import os\n    os.system(name)\n",
+            "required_imports": [], "probes": [],
+            "used_escalation": False, "used_deterministic_rule": False, "punted": False,
+            "risk_flag": False, "security_flag": True,
+            "security_findings": [{"rule_id": "py-os-system", "line": 2, "message": "danger"}],
+            "mutation_confidence_flag": False,
+            "compiler_stderr": "",
+        }
+        with patch("main.modernize", return_value=fake_state), \
+             patch("main.verify", return_value={"status": "success", "stdout": "", "stderr": "", "exit_code": 0}):
+            stats = main.run_file(file_path, open_pr=False, max_iterations=5)
+
+    assert len(stats["security_flagged"]) == 1
+    assert stats["security_flagged"][0]["start_line"] == 5  # 1-indexed line "def greet" starts on

@@ -15,6 +15,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  security-events: write  # required for the SARIF upload step below
 
 jobs:
   modernize:
@@ -29,6 +30,10 @@ jobs:
           pr: "true"
           github-token: ${{ secrets.GITHUB_TOKEN }}
           max-llm-calls: "200"
+          upload-sarif: "true"  # publishes security findings to the repo's
+                                 # Code Scanning dashboard; drop this line
+                                 # (or the security-events permission above)
+                                 # if you don't want that.
 
       - name: Upload run report
         if: always()
@@ -38,3 +43,4 @@ jobs:
           path: |
             modernizer-report.json
             modernizer-report.html
+            modernizer-report.sarif

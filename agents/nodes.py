@@ -304,6 +304,25 @@ def _format_type_definitions_block(referenced_type_definitions: list[str] | None
     )
 
 
+def _format_exemplar_block(exemplar_original: str | None, exemplar_modernized: str | None) -> str:
+    """Formats the single most semantically-similar PAST successful
+    modernization (see exemplar_bank.py) as a worked example, or '' if
+    none is available. In-context learning from this project's own
+    proven track record — shown ONLY on the first (blind) attempt, not
+    retries: once there's real compiler/behavioral error feedback, that
+    feedback is more directly useful than a generic worked example."""
+    if not exemplar_original or not exemplar_modernized:
+        return ""
+    return (
+        "Here is an example of a similar function this project has ALREADY "
+        "successfully modernized (verified equivalent, from a past run) — use it "
+        "as a style guide for the kind of transformation to make, not as literal "
+        "code to copy:\n"
+        f"Before:\n{exemplar_original}\n\n"
+        f"After:\n{exemplar_modernized}\n\n"
+    )
+
+
 def refactorer_node(state: AgentState) -> AgentState:
     handler = get_handler_by_name(state["language"])
     recipe_instruction = state.get("recipe_instruction")
@@ -334,9 +353,10 @@ def refactorer_node(state: AgentState) -> AgentState:
             }
 
     if state["iteration_count"] == 0:
+        exemplar_block = _format_exemplar_block(state.get("exemplar_original"), state.get("exemplar_modernized"))
         messages = [
             SystemMessage(content=_with_recipe(handler.refactor_system_prompt, recipe_instruction)),
-            HumanMessage(content=f"{context_block}{state['original_code']}"),
+            HumanMessage(content=f"{exemplar_block}{context_block}{state['original_code']}"),
         ]
     else:
         messages = [

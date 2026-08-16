@@ -20,7 +20,15 @@ Supports Python, JavaScript, TypeScript, Java, C++, and PHP out of the box.
    elsewhere in the same file and (in repo mode) sibling files, PLUS the
    full definition (fields/methods) of any class/struct/interface the
    chunk actually references — so the model applies type hints and uses
-   other types correctly instead of guessing at their shape.
+   other types correctly instead of guessing at their shape. In a large
+   repo, which sibling files make the cut can optionally be ranked by
+   actual semantic relevance (a local embedding model, e.g.
+   `nomic-embed-text` — see `[context]` in `.modernizer.toml.example`)
+   instead of just "the first N discovered". The same setting also
+   enables a local few-shot exemplar bank (`exemplar_bank.py`): every
+   clean successful modernization is remembered, and the most similar
+   past success is shown as a worked before/after example on each
+   chunk's first attempt.
    Chunks that are already modern are skipped with zero LLM calls, and a
    chunk a provably-safe deterministic rule can handle (e.g. JS `var` →
    `let`/`const`, PHP `array()` → `[]` — see `deterministic_rules.py`)
@@ -102,6 +110,9 @@ Examples:
 
 # Pause for human approval on any risky/low-confidence chunk
 ./run.sh path/to/legacy_module.py --interactive
+
+# Only process currently git-staged files — drop into .git/hooks/pre-commit
+./run.sh . --staged
 ```
 
 Key flags (see `python main.py --help` for the full list):
@@ -117,6 +128,7 @@ Key flags (see `python main.py --help` for the full list):
 | `--recipe NAME` | Scope this run to a named `[recipes.NAME]` table in `.modernizer.toml` |
 | `--watch` | Run an initial full pass, then keep watching `path` and modernize only changed files, forever (Ctrl+C to stop) |
 | `--watch-interval N` | Seconds between change-detection polls in `--watch` mode (default 5) |
+| `--staged` | Process only files currently staged for commit (`git add`) — the event-driven, pre-commit-hook-shaped complement to `--watch` |
 | `--punt-check` | Ask the model to self-assess confidence before attempting each chunk; skip chunks it doubts, before any rewrite attempt |
 | `--run-target-tests` | Run the target repo's own test suite as an extra gate |
 | `--generate-regression-tests` | Generate regression tests (embeds MODERNIZED code) for successfully modernized chunks |
@@ -124,6 +136,7 @@ Key flags (see `python main.py --help` for the full list):
 | `--interactive` | Pause and prompt for approval on flagged chunks |
 | `--report PATH` | Write a structured JSON run report |
 | `--report-html PATH` | Write a self-contained HTML run report (per-chunk status, flags, diffs) — open it in a browser |
+| `--sarif-report PATH` | Write accumulated security findings as SARIF 2.1.0, for GitHub Code Scanning / Advanced Security |
 
 ## Configuration
 

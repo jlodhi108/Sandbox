@@ -13,3 +13,9 @@ dist/
 # machine run history that gates auto-PR eligibility, not source. Never
 # meant to be shared/committed; each clone/machine builds its own.
 .modernizer_history.json
+
+# Local few-shot exemplar bank (see exemplar_bank.py) — accumulated
+# per-machine successful (original, modernized) diff pairs, only
+# written when EMBEDDING_MODEL is configured. Same footing as
+# .modernizer_history.json above: local run state, not source.
+.modernizer_exemplars.json

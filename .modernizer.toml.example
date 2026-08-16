@@ -35,6 +35,12 @@ workers = 1
 # `report`; set both to get both.
 # report_html = "modernizer-report.html"
 #
+# SARIF 2.1.0 output for accumulated static-security-scan findings (see
+# sandbox/security-rules.yaml) — the standard format GitHub Code Scanning
+# / Advanced Security (and most other CI security dashboards) ingest
+# directly. Independent of `report`/`report_html`; set any combination.
+# sarif_report = "modernizer-report.sarif"
+#
 # Hard ceiling on total LLM calls for ONE run (a single file, or a whole
 # repo run) — unset means unlimited. best-of-N x retry-iterations x
 # probes x chunks x files can multiply fast with nothing capping it
@@ -163,6 +169,30 @@ workers = 1
 # Desktop's managed VM (macOS/Windows) has no supported way to add a
 # runtime to it at all, so this option is a no-op there regardless.
 # runtime = "runsc"
+
+[context]
+# Optional local embedding model (pulled via `ollama pull nomic-embed-text`
+# exactly like any other model this project uses) for RANKING sibling
+# files by actual semantic relevance when building the cross-file
+# grounding context (see agents/graph.py's _extract_context_signatures /
+# _extract_referenced_type_definitions) — without this, the existing
+# capped scan just takes the first N sibling files in discovery order,
+# which in a large repo often aren't the most relevant N. Off by
+# default: the existing scan already works, this just makes it more
+# precise at repo scale, and it costs an extra Ollama embedding call per
+# sibling file per run (cached within a run, but not free). Good
+# defaults if you want to try it: "nomic-embed-text" (small, fast,
+# CPU-friendly) or "qwen3-embedding" (higher quality, more VRAM).
+# embedding_model = "nomic-embed-text"
+#
+# Setting embedding_model ALSO enables the few-shot exemplar bank (see
+# exemplar_bank.py): every CLEAN successful modernization (no risk/
+# security/low-confidence flag) gets remembered locally
+# (.modernizer_history.json's sibling, .modernizer_exemplars.json —
+# gitignored, per-machine state), and the most similar past success is
+# shown as a worked "before/after" example on each chunk's first
+# attempt. No separate setting — it's the same embedding_model gate,
+# since showing an unranked example would do more harm than good.
 
 [observability]
 # Per-chunk LLM tracing via LangSmith (smith.langchain.com) — token

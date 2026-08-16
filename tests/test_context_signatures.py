@@ -81,3 +81,19 @@ def test_gracefully_handles_a_sibling_file_in_a_different_language():
     js_sibling = b"function notPython(x) { return x + 1; }\n"
     sigs = _extract_context_signatures(handler, full_source, 0, 0, [js_sibling])
     assert "def a(x):" in sigs  # doesn't crash; garbage sibling content just contributes nothing useful
+
+
+def test_uses_embeddings_ranking_when_enabled():
+    from unittest.mock import patch
+
+    handler = PythonHandler()
+    full_source = b"def a(x):\n    return x\n"
+    siblings = [b"def b(y):\n    return y\n"]
+
+    with patch("agents.graph.embeddings.rank_by_relevance", return_value=siblings) as mock_rank:
+        _extract_context_signatures(handler, full_source, 0, len(full_source), siblings)
+
+    mock_rank.assert_called_once()
+    call_args = mock_rank.call_args[0]
+    assert call_args[0] == "def a(x):\n    return x\n"  # the chunk's own code as the query
+    assert call_args[1] == siblings

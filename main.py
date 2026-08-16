@@ -31,6 +31,7 @@ from llm_budget import BudgetExceededError
 from target_tests import detect_test_command, run_test_command, run_target_tests_on_copy
 from regression_tests import generate_regression_test_file, regression_test_filename
 from characterization_tests import generate_characterization_test_file, characterization_test_filename
+from sarif_report import write_sarif_report
 
 # Loaded once at startup, read against for every auto-PR eligibility
 # check this run makes — always reflects PRIOR runs only. Updated with
@@ -466,7 +467,15 @@ def run_file(
                 for f in findings:
                     print(f"      - {f['rule_id']} (line {f['line']}): {f['message']}")
                 stats["security_flagged"].append({
-                    "kind": chunk.kind, "start_byte": chunk.start_byte, "findings": findings,
+                    "kind": chunk.kind, "start_byte": chunk.start_byte,
+                    # 1-indexed line this chunk STARTS at in the real file —
+                    # semgrep's own `line` on each finding is relative to the
+                    # isolated single-chunk file it actually scanned (see
+                    # scan_security's docstring), not the real file, so a
+                    # SARIF report (sarif_report.py) needs this offset to
+                    # report a real, useful line number.
+                    "start_line": source[:chunk.start_byte].count(b"\n") + 1,
+                    "findings": findings,
                 })
             if final_state.get("mutation_confidence_flag"):
                 print(f"    LOW CONFIDENCE: {final_state.get('mutation_confidence_reason', '')}")
@@ -783,7 +792,7 @@ def run_repo(
     root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1, run_target_tests: bool = False,
     generate_regression_tests: bool = False, interactive: bool = False,
     recipe_instruction: str | None = None, isolate_workers: bool = False, punt_check_enabled: bool = False,
-    characterize: bool = False,
+    characterize: bool = False, staged_only: bool = False,
 ) -> list[dict]:
     global _last_target_test_result
     _last_target_test_result = None
@@ -804,8 +813,16 @@ def run_repo(
                 f"--isolate-workers requires {root_dir!r} to be a git repository "
                 f"(needs `git worktree` to isolate each worker's checkout)."
             )
-    files = discover_files(root_dir)
-    print(f"Found {len(files)} modernizable file(s) under {root_dir}")
+    if staged_only:
+        from git_ops.staged import get_staged_files
+        from git_ops.worktree import is_git_repo
+        if not is_git_repo(root_dir):
+            raise ValueError(f"--staged requires {root_dir!r} to be a git repository.")
+        files = get_staged_files(root_dir)
+        print(f"Found {len(files)} modernizable staged file(s) under {root_dir}")
+    else:
+        files = discover_files(root_dir)
+        print(f"Found {len(files)} modernizable file(s) under {root_dir}")
 
     file_contents = _read_all_file_contents(files)
 
@@ -1253,6 +1270,14 @@ def main():
              "instead of reading raw JSON. Independent of --report; pass both to get both.",
     )
     parser.add_argument(
+        "--sarif-report", metavar="PATH", default=_settings.get("sarif_report"),
+        help="Write accumulated static-security-scan findings (see --help for how "
+             "chunks get flagged) as a SARIF 2.1.0 file — the standard format GitHub "
+             "Code Scanning / Advanced Security (and most other CI security dashboards) "
+             "ingest directly, e.g. via github/codeql-action/upload-sarif in a workflow. "
+             "Independent of --report/--report-html; pass any combination.",
+    )
+    parser.add_argument(
         "--workers", type=int, default=_settings.get("workers", 1),
         help="Process this many files concurrently in repo mode (default 1 = sequential). "
              "Each worker runs its own Docker containers and LLM calls — mind your machine's "
@@ -1311,6 +1336,16 @@ def main():
              "anything. Supported for python/javascript/typescript/php; a no-op for cpp/java.",
     )
     parser.add_argument(
+        "--staged", action="store_true", default=_settings.get("staged", False),
+        help="Repo mode only: process ONLY files currently staged for commit (`git add`), "
+             "instead of every modernizable file under `path`. The event-driven, pre-commit-"
+             "hook-shaped complement to --watch (triggered by the commit itself, not a "
+             "background poll loop) — typical use: a .git/hooks/pre-commit that runs "
+             "`code-modernizer --staged .` before every commit. `path` must be a git "
+             "repository; cross-file context grounding (sibling signatures/types) only sees "
+             "OTHER staged files, not the whole repo, in this mode.",
+    )
+    parser.add_argument(
         "--interactive", action="store_true", default=_settings.get("interactive", False),
         help="Pause on any chunk flagged (risk, security, or low-confidence mutation check) "
              "and prompt right here in the terminal to approve or reject it, instead of just "
@@ -1362,6 +1397,10 @@ def main():
 
     if args.plan and args.watch:
         parser.error("--plan and --watch are not compatible — --plan makes one static estimate, --watch runs forever.")
+    if args.staged and args.watch:
+        parser.error("--staged and --watch are not compatible — --staged is a one-shot pre-commit-hook mode, --watch runs forever.")
+    if args.staged and not os.path.isdir(args.path):
+        parser.error("--staged requires `path` to be a directory (a git repository).")
 
     if args.plan:
         # Deliberately short-circuits before touching llm_budget, Docker,
@@ -1405,6 +1444,7 @@ def main():
             args.run_target_tests, args.generate_regression_tests, args.interactive,
             recipe_instruction=_recipe_instruction, isolate_workers=args.isolate_workers,
             punt_check_enabled=args.punt_check, characterize=args.characterize,
+            staged_only=args.staged,
         )
         mode = "repo"
     else:
@@ -1447,6 +1487,9 @@ def main():
         write_report(args.report, mode, results)
     if args.report_html:
         write_html_report(args.report_html, mode, results)
+    if args.sarif_report:
+        write_sarif_report(args.sarif_report, results)
+        print(f"Wrote SARIF security report to {args.sarif_report}")
 
 
 if __name__ == "__main__":

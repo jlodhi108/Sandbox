@@ -577,3 +577,50 @@ def test_referenced_type_definitions_populated_and_reach_the_refactor_prompt():
     # And it actually reached the refactor prompt, not just the state.
     refactor_human_message = fake_llm.calls[0][1]
     assert "class ConfigError(Exception):" in refactor_human_message.content
+
+
+def test_exemplar_retrieved_and_reaches_prompt_when_embeddings_enabled():
+    exemplar = {"original": "def old(a, b): return a+b", "modernized": "def old(a: int, b: int) -> int: return a+b"}
+    fake_llm = ScriptedLLM([
+        "int add(int a, int b) { return a + b; }",  # refactor attempt 1
+        _RISK_NO,                                     # risk assessment
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None), \
+         patch("agents.graph.exemplar_bank.find_best_exemplar", return_value=exemplar) as mock_find, \
+         patch("agents.graph.exemplar_bank.record") as mock_record:
+        final_state = modernize("cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")), max_iterations=5)
+
+    mock_find.assert_called_once()
+    assert final_state["exemplar_original"] == exemplar["original"]
+    assert final_state["exemplar_modernized"] == exemplar["modernized"]
+    refactor_human_message = fake_llm.calls[0][1]
+    assert exemplar["original"] in refactor_human_message.content
+    assert exemplar["modernized"] in refactor_human_message.content
+    # A clean success (no risk/security/low-confidence flag) must be
+    # recorded as a NEW exemplar for future runs.
+    mock_record.assert_called_once()
+
+
+def test_exemplar_not_recorded_when_risk_flagged():
+    fake_llm = ScriptedLLM([
+        "int add(int a, int b) { return a + b; }",  # refactor attempt 1
+        "RISK: yes\nTouches global state.",           # risk assessment — flagged
+    ])
+    fake_verify = QueuedVerify([_OK])
+
+    with patch("agents.nodes.llm", fake_llm), \
+         patch("agents.nodes.verify", fake_verify), \
+         patch("agents.graph.verify", fake_verify), \
+         patch("agents.nodes.escalation_llm", None), \
+         patch("agents.graph.exemplar_bank.find_best_exemplar", return_value=None), \
+         patch("agents.graph.exemplar_bank.record") as mock_record:
+        final_state = modernize("cpp", _CPP_SOURCE, 0, len(_CPP_SOURCE.rstrip(b"\n")), max_iterations=5)
+
+    assert final_state["status"] == "success"
+    assert final_state["risk_flag"] is True
+    mock_record.assert_not_called()

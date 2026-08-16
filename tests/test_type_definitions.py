@@ -120,3 +120,17 @@ def test_referenced_type_definitions_caps_at_max_type_definitions():
     chunk_code = f"def f():\n    return [{references}]"
     defs = _extract_referenced_type_definitions(handler, chunk_code, full_source, None)
     assert len(defs) == MAX_TYPE_DEFINITIONS
+
+
+def test_referenced_type_definitions_uses_embeddings_ranking_when_enabled():
+    from unittest.mock import patch
+
+    handler = PythonHandler()
+    full_source = b"def load_config(path):\n    raise ConfigError('bad')\n"
+    sibling = b"class ConfigError(Exception):\n    pass\n"
+    chunk_code = "def load_config(path):\n    raise ConfigError('bad')"
+
+    with patch("agents.graph.embeddings.rank_by_relevance", return_value=[sibling]) as mock_rank:
+        _extract_referenced_type_definitions(handler, chunk_code, full_source, [sibling])
+
+    mock_rank.assert_called_once_with(chunk_code, [sibling])

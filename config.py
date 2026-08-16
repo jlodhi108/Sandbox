@@ -43,15 +43,17 @@ def load_recipes(config: dict) -> dict[str, str]:
 def apply_config_to_environment(config: dict) -> None:
     """Push config values that other modules read from os.environ at
     IMPORT time (ESCALATION_MODEL, ESCALATION_THRESHOLD, REVIEWER_MODEL,
-    GITHUB_REPO) into the environment — using setdefault, so an
-    already-set env var (from the shell, or from .env via load_dotenv())
-    always wins over the config file. Precedence end to end: CLI flag >
-    env var > .env file > config file > hardcoded default.
+    GITHUB_REPO, EMBEDDING_MODEL) into the environment — using setdefault,
+    so an already-set env var (from the shell, or from .env via
+    load_dotenv()) always wins over the config file. Precedence end to
+    end: CLI flag > env var > .env file > config file > hardcoded default.
 
     Must be called BEFORE `from agents.graph import modernize` for
-    ESCALATION_MODEL/ESCALATION_THRESHOLD/REVIEWER_MODEL/SANDBOX_RUNTIME
-    specifically — those are read from os.environ once at that import's
-    module-load time, so anything set only here would silently never
+    ESCALATION_MODEL/ESCALATION_THRESHOLD/REVIEWER_MODEL/SANDBOX_RUNTIME/
+    EMBEDDING_MODEL specifically — those are read from os.environ once at
+    that import's module-load time (agents.graph imports embeddings,
+    which reads EMBEDDING_MODEL exactly like agents.nodes reads
+    ESCALATION_MODEL), so anything set only here would silently never
     take effect if this ran after it. LANGSMITH_TRACING/PROJECT/ENDPOINT
     don't share that constraint (confirmed by reading langchain_core's
     callback manager: tracing config is resolved fresh on every
@@ -73,6 +75,10 @@ def apply_config_to_environment(config: dict) -> None:
     sandbox = config.get("sandbox", {})
     if "runtime" in sandbox:
         os.environ.setdefault("SANDBOX_RUNTIME", str(sandbox["runtime"]))
+
+    context = config.get("context", {})
+    if "embedding_model" in context:
+        os.environ.setdefault("EMBEDDING_MODEL", str(context["embedding_model"]))
 
     observability = config.get("observability", {})
     if observability.get("tracing"):

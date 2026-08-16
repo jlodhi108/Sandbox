@@ -75,6 +75,7 @@ runs:
           --max-iterations "${{ inputs.max-iterations }}"
           --report "${{ inputs.report }}"
           --report-html "${{ inputs.report-html }}"
+          --sarif-report "${{ inputs.sarif-report }}"
         )
         if [ "${{ inputs.pr }}" = "true" ]; then
           ARGS+=(--pr)
@@ -89,6 +90,16 @@ runs:
           ARGS+=(--workers "${{ inputs.workers }}")
         fi
         python "${{ github.action_path }}/main.py" "${ARGS[@]}"
+
+    - name: Upload security findings to GitHub Code Scanning
+      # hashFiles guards against main.py exiting before it ever reached
+      # the SARIF-write step (an earlier crash, or upload-sarif simply
+      # disabled) — the action errors on a missing file, so this must
+      # not attempt the upload when there's nothing to upload.
+      if: always() && inputs.upload-sarif == 'true' && hashFiles(inputs.sarif-report) != ''
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ github.workspace }}/${{ inputs.sarif-report }}
 
 inputs:
   path:
@@ -134,6 +145,18 @@ inputs:
     description: "Path (relative to the workspace) to write the human-readable HTML run report."
     required: false
     default: "modernizer-report.html"
+  sarif-report:
+    description: "Path (relative to the workspace) to write accumulated security findings as SARIF 2.1.0."
+    required: false
+    default: "modernizer-report.sarif"
+  upload-sarif:
+    description: >-
+      Upload the SARIF report to GitHub Code Scanning via
+      github/codeql-action/upload-sarif. Requires the CALLING workflow's job to
+      grant `permissions: security-events: write` — this action runs with
+      whatever permissions that job already has, it cannot grant its own.
+    required: false
+    default: "false"
 
 outputs:
   report:
@@ -142,6 +165,9 @@ outputs:
   report-html:
     description: "Path to the HTML run report."
     value: ${{ inputs.report-html }}
+  sarif-report:
+    description: "Path to the SARIF security report."
+    value: ${{ inputs.sarif-report }}
 
 branding:
   icon: "refresh-cw"

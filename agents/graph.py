@@ -10,6 +10,8 @@ from agents.nodes import (
 from agents.review_graph import start_review
 from languages import get_handler_by_name
 from sandbox.verifier import verify
+import embeddings
+import exemplar_bank
 
 MAX_PROBES_PER_CHUNK = 3
 MAX_REAL_CALL_SITE_PROBES = 2
@@ -188,7 +190,13 @@ def _extract_context_signatures(
 
     if _collect(full_source, (chunk_start, chunk_end)):
         return signatures
-    for sibling_source in (sibling_sources or [])[:MAX_CONTEXT_SIBLING_FILES]:
+    # Ranked by semantic relevance when embeddings.EMBEDDING_MODEL is
+    # configured; otherwise ranking is a no-op and this is exactly the
+    # positional "first N discovered" order it always was — see
+    # embeddings.py's module docstring for why this is opt-in.
+    query_code = full_source[chunk_start:chunk_end].decode("utf-8", errors="replace")
+    ranked_siblings = embeddings.rank_by_relevance(query_code, sibling_sources or [])
+    for sibling_source in ranked_siblings[:MAX_CONTEXT_SIBLING_FILES]:
         if _collect(sibling_source, None):
             return signatures
     return signatures
@@ -228,7 +236,8 @@ def _extract_referenced_type_definitions(
     types_found: dict[str, tuple[bytes, int, int]] = {}
     for name, (start, end) in handler.extract_type_definitions(full_source).items():
         types_found.setdefault(name, (full_source, start, end))
-    for sibling_source in (sibling_sources or [])[:MAX_CONTEXT_SIBLING_FILES]:
+    ranked_siblings = embeddings.rank_by_relevance(chunk_code, sibling_sources or [])
+    for sibling_source in ranked_siblings[:MAX_CONTEXT_SIBLING_FILES]:
         for name, (start, end) in handler.extract_type_definitions(sibling_source).items():
             types_found.setdefault(name, (sibling_source, start, end))
 
@@ -258,6 +267,7 @@ def _punted_initial_state(
         "original_code": original_code, "modernized_code": "", "required_imports": [],
         "candidate_codes": [], "baseline_stdout": None, "probes": [],
         "context_signatures": [], "referenced_type_definitions": [],
+        "exemplar_original": None, "exemplar_modernized": None,
         "used_escalation": False, "used_deterministic_rule": False,
         "risk_flag": False, "risk_reason": "", "security_flag": False, "security_findings": [],
         "mutation_confidence_flag": False, "mutation_confidence_reason": "",
@@ -299,6 +309,7 @@ def modernize(
     probes = _capture_function_probes(language, full_source, original_code, sibling_sources)
     context_signatures = _extract_context_signatures(handler, full_source, chunk_start, chunk_end, sibling_sources)
     referenced_type_definitions = _extract_referenced_type_definitions(handler, original_code, full_source, sibling_sources)
+    exemplar = exemplar_bank.find_best_exemplar(language, original_code)
     initial_state: AgentState = {
         "language": language,
         "full_source": full_source,
@@ -312,6 +323,8 @@ def modernize(
         "probes": probes,
         "context_signatures": context_signatures,
         "referenced_type_definitions": referenced_type_definitions,
+        "exemplar_original": exemplar["original"] if exemplar else None,
+        "exemplar_modernized": exemplar["modernized"] if exemplar else None,
         "used_escalation": False,
         "used_deterministic_rule": False,
         "punted": False,
@@ -350,6 +363,17 @@ def modernize(
             "mutation_confidence_flag": mutation_confidence_flag,
             "mutation_confidence_reason": mutation_confidence_reason,
         }
+
+        # Only a CLEAN success (no risk/security/low-confidence flag)
+        # gets remembered as a future few-shot exemplar — a flagged
+        # chunk is "successful but suspect," and using it to steer
+        # FUTURE modernizations would risk propagating a possibly-
+        # subtly-wrong pattern instead of a genuinely proven one.
+        # exemplar_bank.record is itself a no-op unless EMBEDDING_MODEL
+        # is configured (see its docstring for why recording and
+        # retrieval share that one gate).
+        if not (risk_flag or security_flag or mutation_confidence_flag):
+            exemplar_bank.record(language, original_code, final_state["modernized_code"])
 
         # interactive=False (default): completely unchanged from before
         # this feature existed — flags are surfaced, nothing pauses.

@@ -119,6 +119,18 @@ def test_apply_config_to_environment_sets_sandbox_runtime():
         os.environ.update(env_backup)
 
 
+def test_apply_config_to_environment_sets_embedding_model():
+    config = {"context": {"embedding_model": "nomic-embed-text"}}
+    env_backup = dict(os.environ)
+    try:
+        os.environ.pop("EMBEDDING_MODEL", None)
+        apply_config_to_environment(config)
+        assert os.environ["EMBEDDING_MODEL"] == "nomic-embed-text"
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
+
+
 def test_apply_config_to_environment_sets_observability_vars():
     config = {"observability": {"tracing": True, "project": "code-modernizer", "endpoint": "https://x.test"}}
     env_backup = dict(os.environ)

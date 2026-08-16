@@ -58,6 +58,19 @@ class AgentState(TypedDict):
                                      # type_definition_query_src (see
                                      # languages/base.py) or chunks that
                                      # reference no locally-defined type.
+    exemplar_original: str | None  # ORIGINAL code of the most semantically
+                                     # similar PAST successful modernization
+                                     # for this language (see
+                                     # exemplar_bank.py), shown alongside
+                                     # exemplar_modernized as a real,
+                                     # in-context "here's a good one" example
+                                     # on the first refactor attempt. Both
+                                     # None unless EMBEDDING_MODEL is
+                                     # configured AND a past success exists —
+                                     # never shown otherwise (an unranked,
+                                     # arbitrary exemplar risks misleading
+                                     # the model more than showing none).
+    exemplar_modernized: str | None
     used_escalation: bool   # True once any attempt on this chunk used the
                              # stronger escalation model, not just the
                              # default — surfaced in the run report
