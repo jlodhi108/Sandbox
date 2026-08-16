@@ -9,10 +9,11 @@ def load_config(path: str | None = None) -> dict:
     file doesn't exist — the config file is entirely optional, every
     setting it can provide already has a hardcoded default or CLI flag.
 
-    Deliberately does NOT support secrets (GITHUB_TOKEN): this file is
-    meant to be committed to the repo it configures, and a committed
-    TOML file is not a safe place for a token. GITHUB_REPO (not secret)
-    is fine here; GITHUB_TOKEN stays .env/shell-env-only."""
+    Deliberately does NOT support secrets (GITHUB_TOKEN, LANGSMITH_API_KEY):
+    this file is meant to be committed to the repo it configures, and a
+    committed TOML file is not a safe place for a token. GITHUB_REPO and
+    the LangSmith project/endpoint (not secret) are fine here; the
+    tokens/API keys stay .env/shell-env-only."""
     config_path = path or DEFAULT_CONFIG_PATH
     if not os.path.isfile(config_path):
         return {}
@@ -28,10 +29,15 @@ def apply_config_to_environment(config: dict) -> None:
     the config file. Precedence end to end: CLI flag > env var >
     .env file > config file > hardcoded default.
 
-    Must be called BEFORE `from agents.graph import modernize` — that
-    import chain reads ESCALATION_MODEL/ESCALATION_THRESHOLD from
-    os.environ at module load time, so anything set only here would
-    silently never take effect if this ran after that import."""
+    Must be called BEFORE `from agents.graph import modernize` for
+    ESCALATION_MODEL/ESCALATION_THRESHOLD/SANDBOX_RUNTIME specifically —
+    those are read from os.environ once at that import's module-load
+    time, so anything set only here would silently never take effect if
+    this ran after it. LANGSMITH_TRACING/PROJECT/ENDPOINT don't share
+    that constraint (confirmed by reading langchain_core's callback
+    manager: tracing config is resolved fresh on every .invoke() call,
+    not baked in when ChatOllama is constructed) but are applied here
+    too, for one consistent place to reason about configuration."""
     escalation = config.get("escalation", {})
     if "model" in escalation:
         os.environ.setdefault("ESCALATION_MODEL", str(escalation["model"]))
@@ -41,3 +47,15 @@ def apply_config_to_environment(config: dict) -> None:
     github = config.get("github", {})
     if "repo" in github:
         os.environ.setdefault("GITHUB_REPO", str(github["repo"]))
+
+    sandbox = config.get("sandbox", {})
+    if "runtime" in sandbox:
+        os.environ.setdefault("SANDBOX_RUNTIME", str(sandbox["runtime"]))
+
+    observability = config.get("observability", {})
+    if observability.get("tracing"):
+        os.environ.setdefault("LANGSMITH_TRACING", "true")
+    if "project" in observability:
+        os.environ.setdefault("LANGSMITH_PROJECT", str(observability["project"]))
+    if "endpoint" in observability:
+        os.environ.setdefault("LANGSMITH_ENDPOINT", str(observability["endpoint"]))

@@ -482,3 +482,49 @@ def test_verifier_node_rejects_nondeterministic_output():
         result = verifier_node(state)
         assert result["status"] == "failed"
         assert "non-deterministic" in result["compiler_stderr"]
+
+
+def test_scan_security_flags_when_findings_present():
+    from agents.nodes import scan_security
+
+    fake_findings = [{"rule_id": "sandbox.py-os-system", "line": 2, "message": "danger"}]
+    with patch("agents.nodes.run_semgrep") as mock_semgrep:
+        mock_semgrep.return_value = {"status": "success", "findings": fake_findings}
+        flagged, findings = scan_security("python", "def f(cmd):\n    os.system(cmd)")
+        assert flagged is True
+        assert findings == fake_findings
+
+
+def test_scan_security_not_flagged_when_clean():
+    from agents.nodes import scan_security
+
+    with patch("agents.nodes.run_semgrep") as mock_semgrep:
+        mock_semgrep.return_value = {"status": "success", "findings": []}
+        flagged, findings = scan_security("python", "def add(a, b):\n    return a + b")
+        assert flagged is False
+        assert findings == []
+
+
+def test_scan_security_fails_safe_on_scanner_error():
+    # If semgrep itself errors (timeout, bad output), must not block or
+    # crash modernization — this is a best-effort extra signal on top of
+    # checks that already proved the change is behaviorally safe.
+    from agents.nodes import scan_security
+
+    with patch("agents.nodes.run_semgrep") as mock_semgrep:
+        mock_semgrep.return_value = {"status": "error", "findings": []}
+        flagged, findings = scan_security("python", "def add(a, b):\n    return a + b")
+        assert flagged is False
+        assert findings == []
+
+
+def test_scan_security_uses_correct_filename_for_language():
+    # Real bug caught during development: semgrep picks its rule subset
+    # by file EXTENSION. Scanning PHP code under "main.py" would
+    # silently apply only Python rules and never find anything.
+    from agents.nodes import scan_security
+
+    with patch("agents.nodes.run_semgrep") as mock_semgrep:
+        mock_semgrep.return_value = {"status": "success", "findings": []}
+        scan_security("php", "<?php\nfunction f() {}")
+        assert mock_semgrep.call_args[0][1] == "main.php"

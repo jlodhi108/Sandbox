@@ -2,9 +2,9 @@
 # omit anything you want to leave at its default, or override via CLI
 # flag / env var (those always win over this file).
 #
-# Do NOT put GITHUB_TOKEN or any other secret in this file — it's meant
-# to be committed alongside the code it configures. Secrets stay in
-# .env or the shell environment.
+# Do NOT put GITHUB_TOKEN, LANGSMITH_API_KEY, or any other secret in
+# this file — it's meant to be committed alongside the code it
+# configures. Secrets stay in .env or the shell environment.
 
 [settings]
 max_iterations = 5
@@ -29,3 +29,36 @@ workers = 1
 # --pr unattended.
 # min_track_record_chunks = 5
 # min_success_rate = 0.8
+
+[sandbox]
+# Stronger container isolation for the sandbox that EXECUTES modernized
+# code (not the semgrep security scan, which never executes anything).
+# "runsc" = gVisor: a user-space kernel that intercepts syscalls instead
+# of letting them reach the host kernel directly, drastically shrinking
+# the attack surface an escape would need. Plain Docker (the default,
+# this setting unset) relies only on resource caps + non-root user + no
+# network — real hardening, but not the same category of guarantee.
+#
+# This is a HOST-level, Linux-only setup step this project cannot
+# provide for you: install gVisor (https://gvisor.dev/docs/user_guide/install/)
+# and register it with the Docker daemon (add to
+# /etc/docker/daemon.json: {"runtimes": {"runsc": {"path": "/usr/local/bin/runsc"}}},
+# then restart Docker) BEFORE setting this — an unregistered runtime name
+# makes every sandbox call fail immediately with a clear Docker error.
+# Works on native Linux Docker (a CI runner, an EC2 box). Docker
+# Desktop's managed VM (macOS/Windows) has no supported way to add a
+# runtime to it at all, so this option is a no-op there regardless.
+# runtime = "runsc"
+
+[observability]
+# Per-chunk LLM tracing via LangSmith (smith.langchain.com) — token
+# counts, latency, and the full prompt/response for every refactor,
+# risk-assessment, and probe-generation call, viewable per run. This
+# project already runs on LangGraph/LangChain, so enabling this needs
+# no code changes: LangChain's chat model classes check these exact
+# environment variables on every call. Requires a (free-tier available)
+# LangSmith account and API key — the key goes in .env as
+# LANGSMITH_API_KEY, never in this file.
+# tracing = true
+# project = "code-modernizer"
+# endpoint = "https://api.smith.langchain.com"  # only for self-hosted LangSmith

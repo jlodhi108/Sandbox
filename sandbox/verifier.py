@@ -1,9 +1,22 @@
 import docker
+import json
 import tempfile
 import shutil
 import os
 
 _client = None
+
+# Optional stronger container isolation (e.g. gVisor's "runsc") for the
+# containers that actually EXECUTE untrusted code. Off by default — a
+# normal Docker install has no such runtime registered, and passing one
+# that doesn't exist is a hard Docker error, so this must never activate
+# unless explicitly configured. This is a genuinely host-level, Linux-
+# only setup step (installing gVisor and registering it with the Docker
+# daemon) that this project can wire up but cannot itself provide —
+# native Docker on Linux (a CI runner, an EC2 box) is where this
+# actually installs; Docker Desktop's managed VM (macOS/Windows) has no
+# supported way to add a runtime to it at all.
+SANDBOX_RUNTIME = os.environ.get("SANDBOX_RUNTIME") or None
 
 
 def _get_client():
@@ -51,7 +64,7 @@ def verify(
 
         container = None
         try:
-            container = client.containers.run(
+            run_kwargs = dict(
                 image=image,
                 command=["bash", "-c", run_cmd],
                 volumes={tmpdir: {"bind": "/workspace", "mode": "rw"}},
@@ -62,6 +75,9 @@ def verify(
                 user="sandboxuser",
                 detach=True,
             )
+            if SANDBOX_RUNTIME:
+                run_kwargs["runtime"] = SANDBOX_RUNTIME
+            container = client.containers.run(**run_kwargs)
 
             try:
                 result = container.wait(timeout=timeout)
@@ -92,6 +108,76 @@ def verify(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def run_semgrep(source_code: str, filename: str, timeout: int = 15, image: str = "sandbox-multi") -> dict:
+    """Static-analysis security scan on `source_code` — does NOT execute
+    it, so it needs the same container isolation as verify() only for
+    consistency, not because scanning itself is risky. Uses a LOCAL,
+    offline rule file (sandbox/security-rules.yaml, baked into the image
+    at /opt/security-rules.yaml) rather than a semgrep registry config
+    (`p/...`): registry configs try to revalidate over the network on
+    every run even when previously cached, and inside a
+    network_disabled container that doesn't fail fast — confirmed by
+    testing directly, it took ~97 seconds to eventually fall back.
+    --metrics=off and --disable-version-check are BOTH required to avoid
+    two separate slow network calls; neither flag alone is enough."""
+    client = _get_client()
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.chmod(tmpdir, 0o777)
+        src_path = os.path.join(tmpdir, filename)
+        with open(src_path, "w") as f:
+            f.write(source_code)
+        os.chmod(src_path, 0o644)
+
+        cmd = (
+            f"semgrep --config=/opt/security-rules.yaml --metrics=off "
+            f"--disable-version-check --json {filename}"
+        )
+        stdout = ""
+        container = None
+        try:
+            run_kwargs = dict(
+                image=image,
+                command=["bash", "-c", cmd],
+                volumes={tmpdir: {"bind": "/workspace", "mode": "rw"}},
+                working_dir="/workspace",
+                mem_limit="512m",
+                nano_cpus=1_000_000_000,
+                network_disabled=True,
+                user="sandboxuser",
+                detach=True,
+            )
+            if SANDBOX_RUNTIME:
+                run_kwargs["runtime"] = SANDBOX_RUNTIME
+            container = client.containers.run(**run_kwargs)
+            try:
+                container.wait(timeout=timeout)
+                stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
+            except Exception:
+                container.kill()
+                return {"status": "error", "findings": []}
+        finally:
+            if container is not None:
+                container.remove(force=True)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {"status": "error", "findings": []}
+
+    findings = [
+        {
+            "rule_id": r["check_id"],
+            "line": r["start"]["line"],
+            "message": r["extra"]["message"],
+        }
+        for r in data.get("results", [])
+    ]
+    return {"status": "success", "findings": findings}
+
+
 if __name__ == "__main__":
     import sys
 
@@ -118,3 +204,10 @@ if __name__ == "__main__":
         print(f"FAILED toolchains: {failures}")
         sys.exit(1)
     print("All toolchains OK")
+
+    semgrep_result = run_semgrep('import os\ndef f(cmd):\n    os.system(cmd)\n', "main.py")
+    print(f"semgrep: {semgrep_result}")
+    if semgrep_result["status"] != "success" or not semgrep_result["findings"]:
+        print("FAILED: semgrep did not detect the known-vulnerable sample")
+        sys.exit(1)
+    print("Semgrep security gate OK")

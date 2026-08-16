@@ -6,7 +6,7 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agents.state import AgentState
-from sandbox.verifier import verify
+from sandbox.verifier import verify, run_semgrep
 from languages import get_handler_by_name
 
 llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0)
@@ -21,6 +21,18 @@ llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0)
 ESCALATION_MODEL = os.environ.get("ESCALATION_MODEL")
 ESCALATION_THRESHOLD = int(os.environ.get("ESCALATION_THRESHOLD", "3"))
 escalation_llm = ChatOllama(model=ESCALATION_MODEL, temperature=0) if ESCALATION_MODEL else None
+
+# Execution-grounded best-of-N: on the FIRST (blind, no error feedback)
+# attempt only, generate this many independent candidates and let
+# verifier_node run the real pipeline (structural + sandbox + behavioral
+# + probes + determinism) against each, keeping whichever one actually
+# passes instead of committing to a single guess. The extra candidate(s)
+# come from _diversity_llm — a separate, higher-temperature instance of
+# the SAME base model — because sampling the deterministic (temperature=0)
+# `llm` twice with an identical prompt would return the same response
+# both times, defeating the purpose.
+BEST_OF_N_ON_FIRST_ATTEMPT = int(os.environ.get("BEST_OF_N_ON_FIRST_ATTEMPT", "2"))
+_diversity_llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0.7)
 
 _LLM_RETRY_ATTEMPTS = 3
 _LLM_RETRY_DELAY_SECONDS = 3
@@ -98,13 +110,36 @@ def refactorer_node(state: AgentState) -> AgentState:
     if used_escalation:
         print(f"    (escalating to {ESCALATION_MODEL} after {state['iteration_count']} failed attempts)")
 
-    response = _invoke_llm_with_retry(selected_llm, messages)
-    fenced = _strip_markdown_fence(response.content)
-    clean_code, required_imports = _extract_required_imports(fenced)
+    llms_to_try = [selected_llm]
+    if state["iteration_count"] == 0 and not used_escalation:
+        # Best-of-N ONLY on the first, blind attempt. Once there's real
+        # compiler/behavioral error feedback (any retry) or we've already
+        # escalated to a stronger model, a second independent blind guess
+        # adds sandbox cost without the same diversity payoff — at that
+        # point the model has specific information to act on, which
+        # matters more than another untargeted guess. The extra
+        # candidate(s) use a HIGHER-temperature instance of the same
+        # model: at temperature=0 (the default `llm`), an identical
+        # prompt returns an all-but-identical response, so reusing
+        # selected_llm again here would mostly just waste an LLM call.
+        llms_to_try.extend([_diversity_llm] * (BEST_OF_N_ON_FIRST_ATTEMPT - 1))
+
+    candidates = []
+    for candidate_llm in llms_to_try:
+        response = _invoke_llm_with_retry(candidate_llm, messages)
+        fenced = _strip_markdown_fence(response.content)
+        clean_code, required_imports = _extract_required_imports(fenced)
+        candidates.append({"code": clean_code, "required_imports": required_imports})
+
     return {
         **state,
-        "modernized_code": clean_code,
-        "required_imports": required_imports,
+        "candidate_codes": candidates,
+        # Kept populated with candidate 0 as a reasonable default for any
+        # code that reads modernized_code directly — verifier_node
+        # authoritatively overwrites both fields with whichever candidate
+        # actually wins once verification runs.
+        "modernized_code": candidates[0]["code"],
+        "required_imports": candidates[0]["required_imports"],
         "used_escalation": used_escalation or state.get("used_escalation", False),
     }
 
@@ -148,17 +183,18 @@ def _validate_single_chunk(handler, code: str) -> str | None:
     return None
 
 
-def verifier_node(state: AgentState) -> AgentState:
-    handler = get_handler_by_name(state["language"])
-
-    validation_error = _validate_single_chunk(handler, state["modernized_code"])
+def _verify_candidate(handler, state: AgentState, code: str, required_imports: list[str]) -> dict:
+    """Run the full verification pipeline (structural validation, sandbox
+    compile/run, whole-file behavioral equivalence, per-probe checks,
+    determinism re-check) against ONE candidate. Returns
+    {"status": "success"|"failed", "compiler_stderr": str}. Extracted out
+    of what used to be verifier_node's entire body so it can be called
+    once per candidate under best-of-N (see refactorer_node's
+    BEST_OF_N_ON_FIRST_ATTEMPT) without duplicating five layers of
+    checking logic for each one."""
+    validation_error = _validate_single_chunk(handler, code)
     if validation_error is not None:
-        return {
-            **state,
-            "compiler_stderr": validation_error,
-            "status": "failed",
-            "iteration_count": state["iteration_count"] + 1,
-        }
+        return {"status": "failed", "compiler_stderr": validation_error}
 
     # Splice the candidate chunk back into the FULL original file and
     # compile/run that — a chunk (one function/method) is not an
@@ -167,8 +203,8 @@ def verifier_node(state: AgentState) -> AgentState:
         full_source=state["full_source"],
         chunk_start=state["chunk_start"],
         chunk_end=state["chunk_end"],
-        modernized_code=state["modernized_code"],
-        required_imports=state.get("required_imports", []),
+        modernized_code=code,
+        required_imports=required_imports,
     )
 
     result = verify(
@@ -181,7 +217,7 @@ def verifier_node(state: AgentState) -> AgentState:
     if result["status"] == "success" and baseline_stdout is not None:
         if result["stdout"] != baseline_stdout:
             return {
-                **state,
+                "status": "failed",
                 "compiler_stderr": (
                     "Your rewritten function compiles and runs, but changes "
                     "the program's output — modernization must not change "
@@ -191,8 +227,6 @@ def verifier_node(state: AgentState) -> AgentState:
                     "Fix the function so it produces IDENTICAL output to "
                     "the original."
                 ),
-                "status": "failed",
-                "iteration_count": state["iteration_count"] + 1,
             }
 
     # Whole-file baseline only proves equivalence for whatever the file's
@@ -214,7 +248,7 @@ def verifier_node(state: AgentState) -> AgentState:
             )
             if probe_result["status"] != "success" or probe_result["stdout"] != baseline:
                 return {
-                    **state,
+                    "status": "failed",
                     "compiler_stderr": (
                         "Your rewritten function compiles and the whole file "
                         "still runs, but calling it directly with representative "
@@ -226,8 +260,6 @@ def verifier_node(state: AgentState) -> AgentState:
                         "Fix the function so it produces IDENTICAL results for "
                         "the same inputs."
                     ),
-                    "status": "failed",
-                    "iteration_count": state["iteration_count"] + 1,
                 }
 
             if i == 0:
@@ -246,7 +278,7 @@ def verifier_node(state: AgentState) -> AgentState:
                 )
                 if probe_result_2["status"] != "success" or probe_result_2["stdout"] != probe_result["stdout"]:
                     return {
-                        **state,
+                        "status": "failed",
                         "compiler_stderr": (
                             "Your rewritten function produces DIFFERENT output "
                             "across two identical runs with the same input — "
@@ -260,14 +292,45 @@ def verifier_node(state: AgentState) -> AgentState:
                             "Fix the function so it produces the SAME output "
                             "every time for the same input."
                         ),
-                        "status": "failed",
-                        "iteration_count": state["iteration_count"] + 1,
                     }
 
+    return {"status": result["status"], "compiler_stderr": result["stderr"]}
+
+
+def verifier_node(state: AgentState) -> AgentState:
+    handler = get_handler_by_name(state["language"])
+
+    candidates = state.get("candidate_codes") or [
+        {"code": state["modernized_code"], "required_imports": state.get("required_imports", [])}
+    ]
+
+    results = []
+    for candidate in candidates:
+        result = _verify_candidate(handler, state, candidate["code"], candidate["required_imports"])
+        results.append(result)
+        if result["status"] == "success":
+            if len(candidates) > 1:
+                print(f"    (best-of-{len(candidates)}: candidate {len(results)} passed)")
+            return {
+                **state,
+                "modernized_code": candidate["code"],
+                "required_imports": candidate["required_imports"],
+                "compiler_stderr": result["compiler_stderr"],
+                "status": "success",
+                "iteration_count": state["iteration_count"] + 1,
+            }
+
+    # None of the candidates passed. Report the FIRST (deterministic,
+    # temperature=0) candidate's error for the fix-prompt on retry — an
+    # arbitrary but consistent choice among N failures, rather than e.g.
+    # whichever failed "most interestingly."
+    first_candidate, first_result = candidates[0], results[0]
     return {
         **state,
-        "compiler_stderr": result["stderr"],
-        "status": result["status"],
+        "modernized_code": first_candidate["code"],
+        "required_imports": first_candidate["required_imports"],
+        "compiler_stderr": first_result["compiler_stderr"],
+        "status": "failed",
         "iteration_count": state["iteration_count"] + 1,
     }
 
@@ -317,6 +380,34 @@ def assess_risk(modernized_code: str) -> tuple[bool, str]:
     match = _RISK_RE.search(text)
     risk_flag = bool(match) and match.group(1).lower() == "yes"
     return risk_flag, text
+
+
+def scan_security(language: str, modernized_code: str) -> tuple[bool, list[dict]]:
+    """Static-analysis security scan (semgrep, local offline rules — see
+    sandbox/security-rules.yaml), run only after a chunk has already
+    passed every behavioral check. Behavioral equivalence (whole-file
+    diff, probes, determinism) proves "does the same thing" — none of
+    it proves "doesn't introduce a NEW vulnerability while doing the
+    same thing." A modernization can pass every existing check while
+    swapping a safe pattern for an unsafe one (e.g. parameterized
+    formatting into a raw f-string used in a shell command), which is
+    exactly the gap this closes. Flags, doesn't block: semgrep's
+    precision isn't perfect (industry benchmarks put community rulesets
+    around 60-65% correct-match rate), so a false positive here must
+    not be able to reject an otherwise-correct modernization — this
+    mirrors assess_risk's flag-not-block design, not the hard-fail
+    design used for compile/behavioral checks.
+
+    Scans under the target language's own sandbox_filename (e.g.
+    "main.php", not always "main.py") — semgrep selects which of the
+    12 rules to apply based on the file EXTENSION, so scanning PHP code
+    under a .py filename would silently apply only the Python rules and
+    find nothing, regardless of what the code actually contains."""
+    handler = get_handler_by_name(language)
+    result = run_semgrep(modernized_code, handler.sandbox_filename)
+    if result["status"] != "success":
+        return False, []
+    return bool(result["findings"]), result["findings"]
 
 
 def fallback_node(state: AgentState) -> AgentState:

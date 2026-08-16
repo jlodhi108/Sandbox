@@ -7,13 +7,14 @@ from dotenv import load_dotenv
 
 from config import load_config, apply_config_to_environment
 
-# Must run before importing agents.graph — agents.nodes reads
-# ESCALATION_MODEL from the environment at import time, so anything
-# configured only in .env or .modernizer.toml (not already exported in
-# the shell) would silently never take effect if this ran after that
-# import. Precedence: shell env > .env > .modernizer.toml > hardcoded
-# default — load_dotenv() first, then apply_config_to_environment()'s
-# setdefault() calls only fill in what's still unset.
+# Must run before importing agents.graph / sandbox.verifier — both read
+# environment variables (ESCALATION_MODEL, SANDBOX_RUNTIME) at import
+# time, so anything configured only in .env or .modernizer.toml (not
+# already exported in the shell) would silently never take effect if
+# this ran after those imports. Precedence: shell env > .env >
+# .modernizer.toml > hardcoded default — load_dotenv() first, then
+# apply_config_to_environment()'s setdefault() calls only fill in what's
+# still unset.
 load_dotenv()
 _config = load_config()
 apply_config_to_environment(_config)
@@ -70,6 +71,41 @@ def _unified_diff(original: str, modernized: str, file_path: str) -> str:
     return "".join(diff_lines)
 
 
+def _format_flags_section(risk_flagged: list[dict], security_flagged: list[dict]) -> str:
+    """Shared by the single-file PR body and (via the same shape) the
+    combined repo-mode PR body — two independent flag types, surfaced
+    separately since they catch different things: risk_flag is "this
+    touches something a stdout-diff can't fully verify" (LLM
+    self-critique), security_flag is "static analysis found a specific
+    pattern" (semgrep). A chunk can be flagged by either, both, or
+    neither."""
+    parts = []
+    if risk_flagged:
+        parts.append(
+            f"**{len(risk_flagged)} chunk(s) flagged for manual review** "
+            f"(touch I/O, global state, randomness, or timing — the "
+            f"automated stdout check can't fully prove these are safe):\n"
+            + "\n".join(f"- {r['kind']} at byte {r['start_byte']}: {r['reason']}" for r in risk_flagged)
+        )
+    else:
+        parts.append("No chunks flagged as higher-risk.")
+
+    if security_flagged:
+        finding_lines = [
+            f"- {s['kind']} at byte {s['start_byte']}: {f['rule_id']} — {f['message']}"
+            for s in security_flagged for f in s["findings"]
+        ]
+        parts.append(
+            f"**{len(security_flagged)} chunk(s) flagged by static security scan** "
+            f"(semgrep, local rules — see sandbox/security-rules.yaml):\n"
+            + "\n".join(finding_lines)
+        )
+    else:
+        parts.append("No security findings.")
+
+    return "\n\n".join(parts)
+
+
 def run_file(
     file_path: str, open_pr: bool, max_iterations: int,
     standalone_pr: bool = True, sibling_sources: list[bytes] | None = None,
@@ -106,6 +142,7 @@ def run_file(
         "chunks_already_modern": 0,
         "chunks_gave_up": 0,
         "risk_flagged": [],
+        "security_flagged": [],
         "chunk_details": [],
         "output_path": None,
         "final_check_passed": None,
@@ -150,6 +187,7 @@ def run_file(
             "used_escalation": final_state.get("used_escalation", False),
             "probe_count": len(final_state.get("probes") or []),
             "risk_flag": final_state.get("risk_flag", False),
+            "security_flag": final_state.get("security_flag", False),
             "duration_seconds": time.time() - chunk_start_time,
         }
 
@@ -176,6 +214,14 @@ def run_file(
                 print(f"    RISK FLAGGED: {reason}")
                 stats["risk_flagged"].append({
                     "kind": chunk.kind, "start_byte": chunk.start_byte, "reason": reason,
+                })
+            if final_state.get("security_flag"):
+                findings = final_state.get("security_findings", [])
+                print(f"    SECURITY FLAGGED: {len(findings)} finding(s)")
+                for f in findings:
+                    print(f"      - {f['rule_id']} (line {f['line']}): {f['message']}")
+                stats["security_flagged"].append({
+                    "kind": chunk.kind, "start_byte": chunk.start_byte, "findings": findings,
                 })
             stats["chunks_succeeded"] += 1
         else:
@@ -215,6 +261,11 @@ def run_file(
         print(f"\n{len(stats['risk_flagged'])} chunk(s) flagged for manual review:")
         for r in stats["risk_flagged"]:
             print(f"  - {r['kind']} at byte {r['start_byte']}: {r['reason']}")
+    if stats["security_flagged"]:
+        print(f"\n{len(stats['security_flagged'])} chunk(s) flagged by security scan:")
+        for s in stats["security_flagged"]:
+            for f in s["findings"]:
+                print(f"  - {s['kind']} at byte {s['start_byte']}: {f['rule_id']} — {f['message']}")
 
     # Each chunk was only ever verified against its immediate predecessor
     # at the time it was modernized — never against the FINAL combination
@@ -254,7 +305,6 @@ def run_file(
             stats["duration_seconds"] = time.time() - start_time
             return stats
 
-        risk_flagged = stats["risk_flagged"]
         url = open_modernization_pr(
             file_path=file_path,
             new_content=new_source.decode("utf-8"),
@@ -265,13 +315,7 @@ def run_file(
                 f"{succeeded}/{len(chunks)} chunks successfully modernized "
                 f"and verified in an isolated sandbox "
                 f"({already_modern_count} already modern, skipped).\n\n"
-                + (
-                    f"**{len(risk_flagged)} chunk(s) flagged for manual review** "
-                    f"(touch I/O, global state, randomness, or timing — the "
-                    f"automated stdout check can't fully prove these are safe):\n"
-                    + "\n".join(f"- {r['kind']} at byte {r['start_byte']}: {r['reason']}" for r in risk_flagged)
-                    if risk_flagged else "No chunks flagged as higher-risk."
-                )
+                + _format_flags_section(stats["risk_flagged"], stats["security_flagged"])
             ),
         )
         stats["pr_url"] = url
@@ -416,10 +460,12 @@ def run_repo(root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1
     total_succeeded = sum(s.get("chunks_succeeded", 0) for s in all_stats)
     total_chunks = sum(s.get("chunks_total", 0) for s in all_stats)
     total_risk = sum(len(s.get("risk_flagged", [])) for s in all_stats)
+    total_security = sum(len(s.get("security_flagged", [])) for s in all_stats)
     files_written = sum(1 for s in all_stats if s.get("output_path"))
     print(f"Chunks modernized: {total_succeeded}/{total_chunks}")
     print(f"Files with output written: {files_written}/{len(files)}")
     print(f"Chunks flagged for manual review: {total_risk}")
+    print(f"Chunks flagged by security scan: {total_security}")
 
     if open_pr:
         pr_url = _open_combined_pr(root_dir, all_stats)
@@ -463,7 +509,8 @@ def _open_combined_pr(root_dir: str, all_stats: list[dict]) -> str | None:
             content = f.read().decode("utf-8")
         files_for_pr.append((s["file_path"], content))
 
-    total_risk = sum(len(s.get("risk_flagged", [])) for s in eligible)
+    all_risk_flagged = [r for s in eligible for r in s.get("risk_flagged", [])]
+    all_security_flagged = [f for s in eligible for f in s.get("security_flagged", [])]
     skipped = len(all_stats) - len(eligible)
     branch_name = f"chore/modernize-repo-{int(time.time())}"
 
@@ -475,9 +522,9 @@ def _open_combined_pr(root_dir: str, all_stats: list[dict]) -> str | None:
             f"Automated repo-wide modernization via code-modernizer.\n\n"
             f"{len(eligible)} file(s) included "
             f"({sum(s['chunks_succeeded'] for s in eligible)} chunks modernized total).\n"
-            + (f"{skipped} file(s) skipped (failed their final behavioral check).\n" if skipped else "")
-            + (f"\n**{total_risk} chunk(s) across all files flagged for manual review** "
-               f"(touch I/O, global state, randomness, or timing)." if total_risk else "")
+            + (f"{skipped} file(s) skipped (failed their final check or language "
+               f"track record).\n" if skipped else "")
+            + "\n" + _format_flags_section(all_risk_flagged, all_security_flagged)
         ),
     )
 

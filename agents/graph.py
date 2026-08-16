@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, END
 
 from agents.state import AgentState
 from agents.nodes import (
-    refactorer_node, verifier_node, fallback_node, assess_risk,
+    refactorer_node, verifier_node, fallback_node, assess_risk, scan_security,
     generate_probes, wrap_call_as_probe,
 )
 from languages import get_handler_by_name
@@ -155,11 +155,14 @@ def modernize(
         "original_code": original_code,
         "modernized_code": "",
         "required_imports": [],
+        "candidate_codes": [],
         "baseline_stdout": baseline_stdout,
         "probes": probes,
         "used_escalation": False,
         "risk_flag": False,
         "risk_reason": "",
+        "security_flag": False,
+        "security_findings": [],
         "compiler_stderr": "",
         "iteration_count": 0,
         "status": "pending",
@@ -167,12 +170,19 @@ def modernize(
     }
     final_state = app.invoke(initial_state)
 
-    # Risk assessment runs once, after the graph is done, only for chunks
-    # that actually succeeded — no point spending an LLM call critiquing
-    # a change that already got rejected.
+    # Risk assessment and security scan both run once, after the graph is
+    # done, only for chunks that actually succeeded — no point spending
+    # extra cycles critiquing a change that already got rejected.
     if final_state["status"] == "success":
         risk_flag, risk_reason = assess_risk(final_state["modernized_code"])
-        final_state = {**final_state, "risk_flag": risk_flag, "risk_reason": risk_reason}
+        security_flag, security_findings = scan_security(language, final_state["modernized_code"])
+        final_state = {
+            **final_state,
+            "risk_flag": risk_flag,
+            "risk_reason": risk_reason,
+            "security_flag": security_flag,
+            "security_findings": security_findings,
+        }
 
     return final_state
 

@@ -1,0 +1,97 @@
+rules:
+  # --- Python ---
+  - id: py-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: "subprocess call with shell=True is a shell-injection risk if any argument is not a hardcoded constant."
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+
+  - id: py-os-system
+    languages: [python]
+    severity: WARNING
+    message: "os.system() executes a shell command — verify no part of the command is attacker-controlled."
+    patterns:
+      - pattern: os.system(...)
+
+  - id: py-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: "eval()/exec() on non-constant input allows arbitrary code execution."
+    patterns:
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: exec(...)
+
+  - id: py-pickle-loads
+    languages: [python]
+    severity: WARNING
+    message: "pickle.loads() on untrusted data allows arbitrary code execution during deserialization."
+    patterns:
+      - pattern: pickle.loads(...)
+
+  # --- JavaScript / TypeScript ---
+  - id: js-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "eval() on non-constant input allows arbitrary code execution."
+    patterns:
+      - pattern: eval(...)
+
+  - id: js-child-process-exec
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "child_process.exec() with a non-constant command is a shell-injection risk — prefer execFile() with an argument array."
+    patterns:
+      - pattern-either:
+          - pattern: require("child_process").exec(...)
+          - pattern: child_process.exec(...)
+
+  - id: js-inner-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "Assigning to innerHTML with non-constant content is an XSS risk — prefer textContent or a sanitizer."
+    patterns:
+      - pattern: $EL.innerHTML = $VAL
+
+  # --- PHP ---
+  - id: php-eval
+    languages: [php]
+    severity: ERROR
+    message: "eval() on non-constant input allows arbitrary code execution."
+    patterns:
+      - pattern: eval(...)
+
+  - id: php-shell-exec
+    languages: [php]
+    severity: ERROR
+    message: "Shell-execution function called — verify no argument is attacker-controlled."
+    patterns:
+      - pattern-either:
+          - pattern: exec(...)
+          - pattern: shell_exec(...)
+          - pattern: system(...)
+          - pattern: passthru(...)
+
+  - id: php-unserialize
+    languages: [php]
+    severity: WARNING
+    message: "unserialize() on untrusted data allows PHP object injection."
+    patterns:
+      - pattern: unserialize(...)
+
+  # --- Java ---
+  - id: java-runtime-exec
+    languages: [java]
+    severity: ERROR
+    message: "Runtime.exec() with a non-constant command is a shell-injection risk."
+    patterns:
+      - pattern: $RT.exec(...)
+
+  # --- C++ ---
+  - id: cpp-system-call
+    languages: [cpp]
+    severity: ERROR
+    message: "system() executes a shell command — verify no part of it is attacker-controlled."
+    patterns:
+      - pattern: system(...)
