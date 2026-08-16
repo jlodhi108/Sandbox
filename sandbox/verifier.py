@@ -27,9 +27,20 @@ def verify(
     just syntax errors)."""
     client = _get_client()
     with tempfile.TemporaryDirectory() as tmpdir:
+        # tempfile creates this dir mode 0700 (owner-only). The container
+        # runs as a non-root user (uid 1000) that doesn't own this
+        # host-side directory, so on native Linux Docker (GitHub Actions
+        # runners) it can't even traverse into it — permission denied on
+        # every file. macOS Docker Desktop's VM layer papers over this
+        # host/container UID mismatch, which is why it never surfaced
+        # locally. Open it up so the container can read the source and
+        # write compiler output (a.out, .class files, tsc's outDir, etc).
+        os.chmod(tmpdir, 0o777)
+
         src_path = os.path.join(tmpdir, filename)
         with open(src_path, "w") as f:
             f.write(source_code)
+        os.chmod(src_path, 0o644)
 
         container = None
         try:
