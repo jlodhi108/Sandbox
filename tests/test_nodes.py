@@ -5,6 +5,7 @@ from agents.nodes import (
     _extract_required_imports,
     _validate_single_chunk,
     _invoke_llm_with_retry,
+    check_requires_resolvable,
     verifier_node,
 )
 from languages.python_lang import PythonHandler
@@ -49,6 +50,49 @@ def test_extract_required_imports_no_markers():
     clean, modules = _extract_required_imports(text)
     assert modules == []
     assert clean == text
+
+
+def test_check_requires_resolvable_accepts_python_stdlib():
+    assert check_requires_resolvable("python", "pathlib") is True
+    assert check_requires_resolvable("python", "collections") is True
+
+
+def test_check_requires_resolvable_accepts_python_stdlib_dotted_submodule():
+    # Only the top-level package name determines resolvability — a
+    # dotted submodule path like "concurrent.futures" is still stdlib.
+    assert check_requires_resolvable("python", "concurrent.futures") is True
+    assert check_requires_resolvable("python", "urllib.request") is True
+
+
+def test_check_requires_resolvable_rejects_python_third_party():
+    # Real PyPI packages included — the sandbox never installs anything,
+    # so these can never resolve regardless of being genuine packages.
+    assert check_requires_resolvable("python", "numpy") is False
+    assert check_requires_resolvable("python", "requests") is False
+    assert check_requires_resolvable("python", "totally-hallucinated-pkg-xyz") is False
+
+
+def test_check_requires_resolvable_accepts_node_builtins():
+    assert check_requires_resolvable("javascript", "fs") is True
+    assert check_requires_resolvable("typescript", "crypto") is True
+
+
+def test_check_requires_resolvable_accepts_node_prefixed_builtins():
+    assert check_requires_resolvable("javascript", "node:fs") is True
+
+
+def test_check_requires_resolvable_rejects_npm_third_party():
+    assert check_requires_resolvable("javascript", "lodash") is False
+    assert check_requires_resolvable("typescript", "axios") is False
+
+
+def test_check_requires_resolvable_returns_none_for_unchecked_languages():
+    # C++/Java/PHP REQUIRES values (headers, FQCNs, namespaces) don't map
+    # to a package-registry concept at all — a bad one fails fast and
+    # clearly at the compile step instead, so this check opts out.
+    assert check_requires_resolvable("cpp", "memory") is None
+    assert check_requires_resolvable("java", "java.util.List") is None
+    assert check_requires_resolvable("php", "Some\\Namespace\\ClassName") is None
 
 
 def test_verifier_node_skips_import_already_present_cpp():
@@ -161,6 +205,26 @@ def test_verifier_node_fails_fast_on_stray_duplicate_without_calling_sandbox():
         assert result["status"] == "failed"
         assert "exactly ONE" in result["compiler_stderr"]
         mock_verify.assert_not_called()  # fails structurally before touching Docker
+
+
+def test_verifier_node_fails_fast_on_hallucinated_package_without_calling_sandbox():
+    state = {
+        "language": "python",
+        "full_source": b"def fetch(url):\n    pass\n",
+        "chunk_start": 0,
+        "chunk_end": 26,
+        "modernized_code": "def fetch(url: str):\n    return requests.get(url)",
+        "required_imports": ["requests"],
+        "compiler_stderr": "",
+        "iteration_count": 0,
+        "status": "pending",
+    }
+    with patch("agents.nodes.verify") as mock_verify:
+        result = verifier_node(state)
+        assert result["status"] == "failed"
+        assert "requests" in result["compiler_stderr"]
+        assert "third-party" in result["compiler_stderr"]
+        mock_verify.assert_not_called()  # rejected before touching Docker at all
 
 
 def test_validate_single_chunk_accepts_php_without_open_tag():

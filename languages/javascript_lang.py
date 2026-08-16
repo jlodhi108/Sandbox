@@ -9,6 +9,36 @@ from languages.base import LanguageHandler
 # etc. — one of the anti-patterns this project's refactor prompt targets.
 _VAR_KEYWORD_RE = re.compile(r"\bvar\b")
 
+# Anything that isn't a valid bare JS identifier character, so a module
+# name like "fs/promises" or "node:fs" can be turned into a safe local
+# require() binding ("fs_promises", "fs") without colliding with the
+# require() PATH string itself, which tolerates those characters fine.
+_JS_IDENTIFIER_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_$]")
+
+
+def _js_require_binding(module: str) -> str:
+    name = _JS_IDENTIFIER_SANITIZE_RE.sub("_", module.removeprefix("node:"))
+    if not name or name[0].isdigit():
+        name = f"_{name}"
+    return name
+
+
+def _js_has_import(source_text: str, module: str) -> bool:
+    return f"require('{module}')" in source_text or f'require("{module}")' in source_text
+
+
+# Node builtin module names that are ALSO ambient TS globals under this
+# project's exact tsc invocation (--target ES2020, which implies the
+# default DOM lib). Injecting `const NAME = require(...)` for either of
+# these collides with the ambient `declare var NAME` TypeScript already
+# provides, raising TS2451 "Cannot redeclare block-scoped variable" —
+# confirmed by compiling all 54 Node builtins through this exact tsc
+# invocation, one at a time: exactly these two collide, none of the
+# others do. Both are also genuinely already-global at RUNTIME in Node
+# 19+ (this sandbox's Node 20.x) with zero require() needed, so the fix
+# isn't a scoping workaround — it's recognizing no import is needed.
+_TS_AMBIENT_GLOBAL_MODULES = frozenset({"console", "crypto"})
+
 
 def _js_already_modern(code: str) -> bool:
     # "No var" alone is too weak: a plain `function foo() {...}` with no
@@ -53,10 +83,12 @@ instead of string concatenation, async/await instead of raw .then() chains,
 and avoid changing the function's observable behavior.
 
 CRITICAL: Your output replaces this exact function in the original file.
-- Do NOT add import/require statements inline. If your rewrite needs
-  something not already imported, request it with a marker line BEFORE
-  the function:
-  // REQUIRES: module-name
+- Do NOT add import/require statements inline. This sandbox has no
+  network access and installs no packages, so only Node.js BUILT-IN
+  modules are usable (fs, path, crypto, util, events, os, url, and
+  similar — never a third-party npm package). If your rewrite needs
+  one, request it with a marker line BEFORE the function:
+  // REQUIRES: fs
   These are stripped automatically and hoisted to the top of the file —
   do not write a real import yourself.
 - Do NOT wrap it in a class definition, even if it's a method — output
@@ -93,6 +125,14 @@ class JavaScriptHandler(LanguageHandler):
     def already_modern(self, code: str) -> bool:
         return _js_already_modern(code)
 
+    def import_statement(self, module: str) -> str:
+        # Plain Node script, no package.json — CommonJS require() is the
+        # only import mechanism that works with zero extra setup here.
+        return f"const {_js_require_binding(module)} = require('{module}');\n"
+
+    def has_import(self, source_text: str, module: str) -> bool:
+        return _js_has_import(source_text, module)
+
     @property
     def refactor_system_prompt(self) -> str:
         return _REFACTOR_PROMPT_TEMPLATE.format(label="JavaScript")
@@ -117,6 +157,31 @@ class TypeScriptHandler(LanguageHandler):
 
     def already_modern(self, code: str) -> bool:
         return _js_already_modern(code)
+
+    def import_statement(self, module: str) -> str:
+        # console/crypto: already an ambient TS global AND already a
+        # runtime global in Node 20.x — no import needed at all (see
+        # _TS_AMBIENT_GLOBAL_MODULES for why injecting one would break
+        # compilation instead of fixing anything).
+        if module.removeprefix("node:") in _TS_AMBIENT_GLOBAL_MODULES:
+            return ""
+        # The sandbox has no @types/node (no per-run install step to put
+        # it where tsc would find it), so plain `require()` fails to
+        # typecheck with "Cannot find name 'require'" even though it's
+        # perfectly valid at runtime. An inline ambient declaration fixes
+        # that with zero image changes — confirmed safe to repeat once
+        # per REQUIRES marker: TypeScript merges identical ambient
+        # declarations without conflict.
+        binding = _js_require_binding(module)
+        return (
+            "declare function require(name: string): any;\n"
+            f"const {binding} = require('{module}');\n"
+        )
+
+    def has_import(self, source_text: str, module: str) -> bool:
+        if module.removeprefix("node:") in _TS_AMBIENT_GLOBAL_MODULES:
+            return True
+        return _js_has_import(source_text, module)
 
     @property
     def refactor_system_prompt(self) -> str:

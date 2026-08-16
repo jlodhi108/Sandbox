@@ -1,7 +1,7 @@
 {
   "python": {
-    "chunks_succeeded": 1,
-    "chunks_attempted": 1
+    "chunks_succeeded": 2,
+    "chunks_attempted": 2
   },
   "cpp": {
     "chunks_succeeded": 2,

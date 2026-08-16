@@ -104,3 +104,57 @@ class Foo {
     chunks = PhpHandler().chunk(src)
     assert len(chunks) == 2
     _assert_no_overlap(chunks)
+
+
+def test_javascript_import_statement_uses_require_not_bare_import():
+    # The base LanguageHandler default ("import {module}\n") isn't valid
+    # JS/TS syntax at all — this asserts the override actually produces
+    # something that parses, not just something different.
+    stmt = JavaScriptHandler().import_statement("fs")
+    assert stmt == "const fs = require('fs');\n"
+
+
+def test_javascript_import_statement_sanitizes_unsafe_binding_names():
+    # "fs/promises" and "node:fs" aren't valid JS identifiers as-is —
+    # only the LOCAL BINDING needs sanitizing, the require() path keeps
+    # the original string untouched.
+    assert JavaScriptHandler().import_statement("fs/promises") == "const fs_promises = require('fs/promises');\n"
+    assert JavaScriptHandler().import_statement("node:fs") == "const fs = require('node:fs');\n"
+
+
+def test_javascript_has_import_detects_existing_require():
+    source = "const fs = require('fs');\nfunction f() {}\n"
+    assert JavaScriptHandler().has_import(source, "fs") is True
+    assert JavaScriptHandler().has_import(source, "path") is False
+
+
+def test_typescript_import_statement_includes_ambient_require_declaration():
+    # Without @types/node in the sandbox, a bare require() fails to
+    # typecheck ("Cannot find name 'require'") even though it's valid at
+    # runtime — the ambient declaration is what makes tsc accept it.
+    stmt = TypeScriptHandler().import_statement("fs")
+    assert "declare function require(name: string): any;" in stmt
+    assert "const fs = require('fs');" in stmt
+
+
+def test_typescript_has_import_detects_existing_require():
+    source = "declare function require(name: string): any;\nconst fs = require('fs');\n"
+    assert TypeScriptHandler().has_import(source, "fs") is True
+    assert TypeScriptHandler().has_import(source, "path") is False
+
+
+def test_typescript_import_statement_skips_ambient_global_collisions():
+    # console/crypto are ALSO ambient TS globals (from the default DOM
+    # lib) — injecting `const crypto = require('crypto')` collides with
+    # TS's own `declare var crypto` and fails to compile (TS2451:
+    # "Cannot redeclare block-scoped variable"), confirmed by compiling
+    # all 54 Node builtins through this project's exact tsc invocation.
+    # Both are already-global at runtime too, so no import is correct.
+    assert TypeScriptHandler().import_statement("crypto") == ""
+    assert TypeScriptHandler().import_statement("console") == ""
+    assert TypeScriptHandler().import_statement("node:crypto") == ""
+
+
+def test_typescript_has_import_treats_ambient_globals_as_already_present():
+    assert TypeScriptHandler().has_import("", "crypto") is True
+    assert TypeScriptHandler().has_import("", "console") is True

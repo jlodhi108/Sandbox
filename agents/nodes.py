@@ -86,6 +86,104 @@ def _extract_required_imports(text: str) -> tuple[str, list[str]]:
     return clean, modules
 
 
+# --- REQUIRES-marker resolvability check ---------------------------------
+#
+# The sandbox that runs candidate code has NO network access and never
+# runs an install step for a per-run dependency (confirmed by testing
+# directly against the sandbox image: `npm install` fails outright with
+# no registry reachable, and nothing in the verify() pipeline ever runs
+# `pip install`/`npm install` for a candidate run). That means a REQUIRES
+# marker can only ever succeed here if it names a module the language
+# runtime ships with built in. Whether a third-party name is a REAL,
+# registered PyPI/npm package or a fully hallucinated one is beside the
+# point — either way it can never resolve in THIS sandbox, so checking it
+# against the public registry would be actively misleading: it would
+# report a perfectly real package as "fine" moments before the sandbox
+# fails it with ModuleNotFoundError/MODULE_NOT_FOUND anyway. So this
+# checks against each runtime's actual builtin module set instead — a
+# fast, exact, zero-network lookup that answers the question that
+# actually matters here ("can this resolve IN THIS SANDBOX"), not "does
+# this exist somewhere in the world".
+#
+# Snapshotted directly from the sandbox-multi image (not hand-typed):
+#   python3 -c "import sys; sorted(m for m in sys.stdlib_module_names if not m.startswith('_'))"
+#   node -e "require('node:module').builtinModules.filter(m => !m.startsWith('_'))"
+# Regenerate both if sandbox/sandbox-multi.Dockerfile's Python or Node
+# version ever changes.
+_PYTHON_STDLIB_MODULES = frozenset({
+    'abc', 'aifc', 'antigravity', 'argparse', 'array', 'ast', 'asynchat', 'asyncio',
+    'asyncore', 'atexit', 'audioop', 'base64', 'bdb', 'binascii', 'bisect', 'builtins',
+    'bz2', 'cProfile', 'calendar', 'cgi', 'cgitb', 'chunk', 'cmath', 'cmd', 'code',
+    'codecs', 'codeop', 'collections', 'colorsys', 'compileall', 'concurrent',
+    'configparser', 'contextlib', 'contextvars', 'copy', 'copyreg', 'crypt', 'csv',
+    'ctypes', 'curses', 'dataclasses', 'datetime', 'dbm', 'decimal', 'difflib', 'dis',
+    'distutils', 'doctest', 'email', 'encodings', 'ensurepip', 'enum', 'errno',
+    'faulthandler', 'fcntl', 'filecmp', 'fileinput', 'fnmatch', 'fractions', 'ftplib',
+    'functools', 'gc', 'genericpath', 'getopt', 'getpass', 'gettext', 'glob', 'graphlib',
+    'grp', 'gzip', 'hashlib', 'heapq', 'hmac', 'html', 'http', 'idlelib', 'imaplib',
+    'imghdr', 'imp', 'importlib', 'inspect', 'io', 'ipaddress', 'itertools', 'json',
+    'keyword', 'lib2to3', 'linecache', 'locale', 'logging', 'lzma', 'mailbox', 'mailcap',
+    'marshal', 'math', 'mimetypes', 'mmap', 'modulefinder', 'msilib', 'msvcrt',
+    'multiprocessing', 'netrc', 'nis', 'nntplib', 'nt', 'ntpath', 'nturl2path', 'numbers',
+    'opcode', 'operator', 'optparse', 'os', 'ossaudiodev', 'pathlib', 'pdb', 'pickle',
+    'pickletools', 'pipes', 'pkgutil', 'platform', 'plistlib', 'poplib', 'posix',
+    'posixpath', 'pprint', 'profile', 'pstats', 'pty', 'pwd', 'py_compile', 'pyclbr',
+    'pydoc', 'pydoc_data', 'pyexpat', 'queue', 'quopri', 'random', 're', 'readline',
+    'reprlib', 'resource', 'rlcompleter', 'runpy', 'sched', 'secrets', 'select',
+    'selectors', 'shelve', 'shlex', 'shutil', 'signal', 'site', 'smtpd', 'smtplib',
+    'sndhdr', 'socket', 'socketserver', 'spwd', 'sqlite3', 'sre_compile', 'sre_constants',
+    'sre_parse', 'ssl', 'stat', 'statistics', 'string', 'stringprep', 'struct',
+    'subprocess', 'sunau', 'symtable', 'sys', 'sysconfig', 'syslog', 'tabnanny', 'tarfile',
+    'telnetlib', 'tempfile', 'termios', 'textwrap', 'this', 'threading', 'time', 'timeit',
+    'tkinter', 'token', 'tokenize', 'tomllib', 'trace', 'traceback', 'tracemalloc', 'tty',
+    'turtle', 'turtledemo', 'types', 'typing', 'unicodedata', 'unittest', 'urllib', 'uu',
+    'uuid', 'venv', 'warnings', 'wave', 'weakref', 'webbrowser', 'winreg', 'winsound',
+    'wsgiref', 'xdrlib', 'xml', 'xmlrpc', 'zipapp', 'zipfile', 'zipimport', 'zlib',
+    'zoneinfo',
+})
+
+_NODE_BUILTIN_MODULES = frozenset({
+    'assert', 'assert/strict', 'async_hooks', 'buffer', 'child_process', 'cluster',
+    'console', 'constants', 'crypto', 'dgram', 'diagnostics_channel', 'dns',
+    'dns/promises', 'domain', 'events', 'fs', 'fs/promises', 'http', 'http2', 'https',
+    'inspector', 'inspector/promises', 'module', 'net', 'os', 'path', 'path/posix',
+    'path/win32', 'perf_hooks', 'process', 'punycode', 'querystring', 'readline',
+    'readline/promises', 'repl', 'stream', 'stream/consumers', 'stream/promises',
+    'stream/web', 'string_decoder', 'sys', 'timers', 'timers/promises', 'tls',
+    'trace_events', 'tty', 'url', 'util', 'util/types', 'v8', 'vm', 'wasi',
+    'worker_threads', 'zlib',
+})
+
+# C++ headers, Java imports, and PHP namespaces have no equivalent "only
+# the runtime's own modules are reachable" ambiguity worth checking here:
+# a bad name in any of those three fails immediately and clearly at the
+# existing compile step (verify(), right after this check runs) with a
+# precise compiler error the fix-retry loop already handles well — so
+# this only covers the languages where a wrong-but-plausible-looking
+# name would otherwise silently burn a full sandbox round-trip first.
+_REQUIRES_CHECK_LANGUAGES = {"python", "javascript", "typescript"}
+
+
+def check_requires_resolvable(language: str, module: str) -> bool | None:
+    """Can this REQUIRES: module marker possibly resolve in the sandbox?
+    Returns True (it's a builtin — will resolve), False (it names a
+    third-party package — can NEVER resolve here, regardless of whether
+    it's a real registered package or a hallucinated one), or None
+    (language not covered by this check — see _REQUIRES_CHECK_LANGUAGES,
+    callers should treat None as "no opinion, let it through")."""
+    if language not in _REQUIRES_CHECK_LANGUAGES:
+        return None
+    if language == "python":
+        # A REQUIRES value may be a dotted submodule path (e.g.
+        # "urllib.request", "concurrent.futures") — only the top-level
+        # package name determines resolvability.
+        top_level = module.split(".", 1)[0]
+        return top_level in _PYTHON_STDLIB_MODULES
+    # javascript / typescript: accept both the bare form ("fs") and the
+    # explicit "node:" prefix ("node:fs") modern code increasingly uses.
+    return module.removeprefix("node:") in _NODE_BUILTIN_MODULES
+
+
 def refactorer_node(state: AgentState) -> AgentState:
     handler = get_handler_by_name(state["language"])
 
@@ -195,6 +293,20 @@ def _verify_candidate(handler, state: AgentState, code: str, required_imports: l
     validation_error = _validate_single_chunk(handler, code)
     if validation_error is not None:
         return {"status": "failed", "compiler_stderr": validation_error}
+
+    for module in required_imports:
+        if check_requires_resolvable(state["language"], module) is False:
+            return {
+                "status": "failed",
+                "compiler_stderr": (
+                    f"REQUIRES: {module} names a third-party package, but "
+                    f"this sandbox has no network access and never installs "
+                    f"dependencies — only modules built into the {state['language']} "
+                    f"runtime itself can ever be used here. Rewrite the "
+                    f"function without this dependency, using only the "
+                    f"standard library/built-in modules."
+                ),
+            }
 
     # Splice the candidate chunk back into the FULL original file and
     # compile/run that — a chunk (one function/method) is not an
@@ -421,20 +533,21 @@ _PROBE_LANGUAGE_LABELS = {
     "php": ("PHP", "echo ...;"),
 }
 
-_PROBE_SYSTEM_PROMPT_TEMPLATE = """You will be given ONE {label} function.
-Write {count} short snippets, each on its own line, that call this
-function with DIFFERENT example arguments and print/output the result —
-so its behavior can be compared across a RANGE of inputs, not just one.
-A single example proves almost nothing about edge cases; {count} varied
-ones is a real check.
+_PROBE_SYSTEM_PROMPT_TEMPLATE = """You will be given ONE {label} function
+and a target number of examples. Write that many short snippets, each on
+its own line, that call this function with DIFFERENT example arguments
+and print/output the result — so its behavior can be compared across a
+RANGE of inputs, not just one. A single example proves almost nothing
+about edge cases; several varied ones is a real check.
 
 Rules:
 - Each line is a complete, independent call+print statement — nothing
   else on that line.
 - Call the function using its exact name as shown.
-- Make the {count} lines meaningfully different: cover a typical case,
-  an edge case (empty string / zero / negative / boundary value), and
-  another distinct typical case — don't just change one digit each time.
+- Make the lines meaningfully different from each other: cover a typical
+  case, an edge case (empty string / zero / negative / boundary value),
+  and another distinct case if more are requested — don't just change
+  one digit each time.
 - Print/output the result using this language's normal mechanism: {print_call}
 - Do NOT redefine the function. Do NOT add imports or requires. Do NOT add
   explanatory text, numbering, or markdown fences.
@@ -442,7 +555,7 @@ Rules:
   scratch (e.g. it takes a database connection), respond with EXACTLY:
   PROBE: SKIP
 
-Respond with ONLY the {count} lines (or PROBE: SKIP), nothing else."""
+Respond with ONLY that many lines (or PROBE: SKIP), nothing else."""
 
 
 def generate_probes(language: str, function_code: str, count: int = 3) -> list[str]:
@@ -454,10 +567,22 @@ def generate_probes(language: str, function_code: str, count: int = 3) -> list[s
     refactorings (generate many inputs, compare outputs across all of
     them, not just one). Returns [] if the model can't/won't produce
     any; callers must treat that as "no synthesized probes available,"
-    not an error."""
+    not an error.
+
+    `count` is deliberately passed via the HUMAN message, not templated
+    into the system prompt: the system prompt is otherwise 100% static
+    per language, which is exactly the shape that lets a caching-aware
+    LLM provider (Claude, GPT — not Ollama, which doesn't bill by token)
+    reuse the cached prefix across every probe-generation call for that
+    language. Templating a per-call value (count varies 1-3 depending on
+    how many real call sites were already found) into the system prompt
+    would silently fragment that cache into one entry per count value."""
     label, print_call = _PROBE_LANGUAGE_LABELS[language]
-    prompt = _PROBE_SYSTEM_PROMPT_TEMPLATE.format(label=label, print_call=print_call, count=count)
-    messages = [SystemMessage(content=prompt), HumanMessage(content=function_code)]
+    prompt = _PROBE_SYSTEM_PROMPT_TEMPLATE.format(label=label, print_call=print_call)
+    messages = [
+        SystemMessage(content=prompt),
+        HumanMessage(content=f"Generate exactly {count} example(s) for this function:\n\n{function_code}"),
+    ]
     response = _invoke_llm_with_retry(llm, messages)
     text = _strip_markdown_fence(response.content).strip()
     if not text or "SKIP" in text.upper():
