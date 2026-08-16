@@ -1,0 +1,35 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-tests:
+    # Tier 1: pure logic, no Docker/LLM needed — chunkers for all 6
+    # languages, splicing, REQUIRES-marker parsing, import injection,
+    # structural single-chunk validation (verify() mocked).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -v
+
+  sandbox-smoke-test:
+    # Tier 2: builds the real multi-toolchain sandbox image (gcc, python3,
+    # node/tsc, javac, php) and compiles+runs a snippet in each language
+    # inside it. GitHub-hosted runners have Docker preinstalled — no LLM
+    # call, so this is fast and free.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: docker build -t sandbox-multi -f sandbox/sandbox-multi.Dockerfile sandbox/
+      - run: python sandbox/verifier.py
