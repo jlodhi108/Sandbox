@@ -22,16 +22,21 @@ import property_testing
 MAX_LLM_CALLS_PER_RUN = os.environ.get("MAX_LLM_CALLS_PER_RUN")
 llm_budget = LLMBudget(max_calls=int(MAX_LLM_CALLS_PER_RUN) if MAX_LLM_CALLS_PER_RUN else None)
 
-# Ollama inference params, sized for qwen2.5-coder:14b rather than the
-# library's defaults (2048 ctx / unbounded predict — too small a context
-# window truncates larger chunks silently instead of erroring, which is
-# worse than being explicit here). Both env-overridable for parity with
-# every other tunable in this module.
+# Ollama inference params, sized for qwen2.5-coder:14b (the default base
+# model) rather than the library's defaults (2048 ctx / unbounded predict
+# — too small a context window truncates larger chunks silently instead
+# of erroring, which is worse than being explicit here). Both
+# env-overridable for parity with every other tunable in this module.
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 OLLAMA_NUM_PREDICT = int(os.environ.get("OLLAMA_NUM_PREDICT", "2048"))
 
+# The workhorse model every chunk is first attempted with. Overridable so
+# this project isn't hardwired to one model — swap in whatever's already
+# pulled locally without editing code.
+BASE_MODEL = os.environ.get("BASE_MODEL", "qwen2.5-coder:14b")
+
 llm = ChatOllama(
-    model="qwen2.5-coder:14b",
+    model=BASE_MODEL,
     temperature=0,
     num_ctx=OLLAMA_NUM_CTX,
     num_predict=OLLAMA_NUM_PREDICT,
@@ -76,7 +81,7 @@ reviewer_llm = (
 # both times, defeating the purpose.
 BEST_OF_N_ON_FIRST_ATTEMPT = int(os.environ.get("BEST_OF_N_ON_FIRST_ATTEMPT", "2"))
 _diversity_llm = ChatOllama(
-    model="qwen2.5-coder:14b",
+    model=BASE_MODEL,
     temperature=0.7,
     num_ctx=OLLAMA_NUM_CTX,
     num_predict=OLLAMA_NUM_PREDICT,

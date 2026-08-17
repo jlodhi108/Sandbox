@@ -13,7 +13,44 @@ import mcp_server
 def test_expected_tools_are_registered():
     tools = asyncio.run(mcp_server.mcp.list_tools())
     names = {t.name for t in tools}
-    assert names == {"modernize_file", "modernize_repo", "check_track_record", "list_track_record"}
+    assert names == {
+        "modernize_file", "modernize_repo", "plan",
+        "check_track_record", "list_track_record",
+    }
+
+
+def test_resolve_recipe_instruction_returns_none_for_no_recipe():
+    assert mcp_server._resolve_recipe_instruction(None) is None
+
+
+def test_resolve_recipe_instruction_looks_up_configured_recipe():
+    with patch.object(mcp_server.main, "_config", {"recipes": {"good": {"instruction": "Do the thing."}}}):
+        assert mcp_server._resolve_recipe_instruction("good") == "Do the thing."
+
+
+def test_resolve_recipe_instruction_raises_for_unknown_recipe():
+    with patch.object(mcp_server.main, "_config", {"recipes": {"good": {"instruction": "Do the thing."}}}):
+        try:
+            mcp_server._resolve_recipe_instruction("bad")
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "bad" in str(e)
+            assert "good" in str(e)
+
+
+def test_plan_reports_scope_and_cost_without_llm_or_docker_calls():
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as root:
+        file_path = os.path.join(root, "calc.py")
+        with open(file_path, "w") as f:
+            f.write("def add(a, b):\n    return a + b\n")
+
+        result = mcp_server.plan(file_path)
+        assert result["summary"]["files"] == 1
+        assert result["summary"]["chunks_total"] == 1
+        assert result["files"][0]["file_path"] == file_path
 
 
 def test_update_track_record_accumulates_and_persists():

@@ -2,7 +2,7 @@ import os
 import tempfile
 from unittest.mock import patch
 
-from main import _scan_mtimes, _diff_changed_files, watch_run
+from main import _scan_mtimes, _diff_changed_files, watch_run, RunOptions
 
 
 def _touch(path: str, content: str = "def f(x):\n    return x + 1\n") -> None:
@@ -60,9 +60,7 @@ def test_watch_run_processes_a_file_edited_mid_watch():
 
         processed = []
 
-        def fake_run_file(fp, open_pr, max_iterations, standalone_pr=True, sibling_sources=None,
-                           generate_regression_tests=False, interactive=False, recipe_instruction=None,
-                           **kwargs):
+        def fake_run_file(fp, options, standalone_pr=True, sibling_sources=None):
             processed.append(fp)
             return {"file_path": fp, "chunks_succeeded": 1}
 
@@ -80,7 +78,7 @@ def test_watch_run_processes_a_file_edited_mid_watch():
         with patch("main.run_repo") as mock_run_repo, \
              patch("main.run_file", side_effect=fake_run_file), \
              patch("main.time.sleep", side_effect=fake_sleep):
-            watch_run(root, open_pr=False, max_iterations=5, initial_pass=True, _max_polls=2)
+            watch_run(root, RunOptions(open_pr=False, max_iterations=5), initial_pass=True, _max_polls=2)
 
         mock_run_repo.assert_called_once()  # the initial full pass
         assert processed == [file_path]
@@ -91,7 +89,7 @@ def test_watch_run_skips_initial_pass_when_disabled():
         _touch(os.path.join(root, "a.py"))
         with patch("main.run_repo") as mock_run_repo, \
              patch("main.time.sleep"):
-            watch_run(root, open_pr=False, max_iterations=5, initial_pass=False, _max_polls=1)
+            watch_run(root, RunOptions(open_pr=False, max_iterations=5), initial_pass=False, _max_polls=1)
 
         mock_run_repo.assert_not_called()
 
@@ -101,5 +99,5 @@ def test_watch_run_stops_cleanly_on_keyboard_interrupt():
         _touch(os.path.join(root, "a.py"))
         with patch("main.run_repo"), \
              patch("main.time.sleep", side_effect=KeyboardInterrupt):
-            watch_run(root, open_pr=False, max_iterations=5, initial_pass=False, _max_polls=None)
+            watch_run(root, RunOptions(open_pr=False, max_iterations=5), initial_pass=False, _max_polls=None)
         # No exception propagated — that's the assertion.

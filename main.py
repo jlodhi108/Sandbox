@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 import difflib
 import os
 import shutil
@@ -6,7 +7,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
-from config import load_config, apply_config_to_environment, load_recipes
+import config
+from config import load_config, apply_config_to_environment, load_recipes, load_profiles
 
 # Must run before importing agents.graph / sandbox.verifier — both read
 # environment variables (ESCALATION_MODEL, SANDBOX_RUNTIME) at import
@@ -50,6 +52,44 @@ _EXCLUDED_DIRS = {
     ".git", "node_modules", "venv", ".venv", "__pycache__",
     "dist", "build", "out", ".next", "target", ".pytest_cache",
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class RunOptions:
+    """Every run-wide behavior toggle, bundled into ONE object instead of
+    threaded as individual parameters through run_file/run_repo/
+    _run_files_concurrently/_run_file_in_worktree/watch_run. Before this,
+    adding one new flag meant editing all 5 of those signatures AND every
+    call site between them in lockstep — exactly the kind of change
+    that's easy to get subtly wrong (confirmed: an earlier version of
+    --characterize had a real early-return bug from exactly this kind of
+    threading). Adding a new option now means adding one field here and
+    reading it at the ONE place that needs it — every function that
+    doesn't care about a given option doesn't need to know it exists.
+
+    Frozen (immutable) deliberately: nothing should mutate a shared
+    RunOptions instance after construction — main() builds exactly one
+    from parsed CLI args and passes it down; mutating it partway through
+    a run would be exactly the kind of implicit, hard-to-trace state
+    change this refactor exists to avoid.
+
+    Deliberately NOT included: file_path/root_dir, sibling_sources,
+    standalone_pr. Those aren't run-wide BEHAVIOR — they're either
+    per-call DATA (sibling_sources genuinely differs file-to-file within
+    one run) or internal wiring (standalone_pr is always False except
+    the single CLI single-file dispatch), not something a user sets
+    once for a whole run the way every field below is."""
+    open_pr: bool = False
+    max_iterations: int = 5
+    workers: int = 1
+    run_target_tests: bool = False
+    generate_regression_tests: bool = False
+    interactive: bool = False
+    recipe_instruction: str | None = None
+    punt_check_enabled: bool = False
+    characterize: bool = False
+    isolate_workers: bool = False
+    staged_only: bool = False
 
 # Set by run_repo() when --run-target-tests is used, read by write_report
 # and the __main__ summary print. A module-level slot rather than a
@@ -287,21 +327,18 @@ def print_plan(plans: list[dict]) -> None:
 
 
 def run_file(
-    file_path: str, open_pr: bool, max_iterations: int,
+    file_path: str, options: RunOptions,
     standalone_pr: bool = True, sibling_sources: list[bytes] | None = None,
-    generate_regression_tests: bool = False, interactive: bool = False,
-    recipe_instruction: str | None = None, punt_check_enabled: bool = False,
-    characterize: bool = False,
 ) -> dict:
     """Modernize one file. Returns a stats dict (also the data source for
     --report) rather than just printing, so repo mode can aggregate
     results across many files without re-parsing terminal output.
 
     standalone_pr controls whether THIS call opens its own single-file
-    PR when open_pr is set. Repo mode passes False here and instead
-    collects every file's output itself, opening ONE combined multi-file
-    PR at the end — GitHub has no atomic multi-file update via the
-    single-file convenience API, so letting each file open its own PR
+    PR when options.open_pr is set. Repo mode passes False here and
+    instead collects every file's output itself, opening ONE combined
+    multi-file PR at the end — GitHub has no atomic multi-file update via
+    the single-file convenience API, so letting each file open its own PR
     would mean N separate PRs for one repo-wide run, which is exactly
     the noisy outcome multi-file mode exists to avoid.
 
@@ -378,9 +415,9 @@ def run_file(
         try:
             final_state = modernize(
                 handler.name, working_source, chunk.start_byte, chunk.end_byte,
-                max_iterations=max_iterations, sibling_sources=sibling_sources,
-                interactive=interactive, recipe_instruction=recipe_instruction,
-                punt_check_enabled=punt_check_enabled,
+                max_iterations=options.max_iterations, sibling_sources=sibling_sources,
+                interactive=options.interactive, recipe_instruction=options.recipe_instruction,
+                punt_check_enabled=options.punt_check_enabled,
             )
             if final_state["status"] == "awaiting_review":
                 final_state = _resolve_interactive_review(final_state)
@@ -426,7 +463,7 @@ def run_file(
 
         stats["chunk_details"].append(chunk_detail)
 
-        if characterize and final_state.get("probes"):
+        if options.characterize and final_state.get("probes"):
             # Captured regardless of final status (success OR gave_up) —
             # probes are captured against the ORIGINAL code before
             # refactorer_node ever runs (see agents/graph.py:modernize),
@@ -499,7 +536,7 @@ def run_file(
             print(f"last error:\n{final_state['compiler_stderr']}")
             stats["chunks_gave_up"] += 1
 
-    if characterize:
+    if options.characterize:
         # Deliberately BEFORE the succeeded==0 early return below —
         # characterization exists precisely FOR the case a file's
         # modernization completely failed: a permanent safety net for
@@ -547,7 +584,7 @@ def run_file(
         f"{already_modern_count} already modern/skipped)"
     )
 
-    if generate_regression_tests:
+    if options.generate_regression_tests:
         isolated_chunks = _isolate_probe_baselines(handler, successful_chunks_for_regression_tests)
         test_source = generate_regression_test_file(handler.name, isolated_chunks)
         if test_source is None:
@@ -594,7 +631,7 @@ def run_file(
         print(f"original: {original_result}")
         print(f"final:    {final_result}")
 
-    if open_pr and standalone_pr:
+    if options.open_pr and standalone_pr:
         if not final_check_passed:
             print("\nRefusing to open a PR: final behavioral check failed. "
                   "Inspect the output file manually before proposing it.")
@@ -701,9 +738,7 @@ def _read_all_file_contents(files: list[str]) -> dict[str, bytes]:
 
 
 def _run_file_in_worktree(
-    root_dir: str, file_path: str, open_pr: bool, max_iterations: int, sibling_sources: list[bytes],
-    generate_regression_tests: bool, recipe_instruction: str | None, punt_check_enabled: bool = False,
-    characterize: bool = False,
+    root_dir: str, file_path: str, options: RunOptions, sibling_sources: list[bytes],
 ) -> dict:
     """Same job as run_file(), but the actual read/chunk/verify/write
     cycle runs against a dedicated git worktree checkout of root_dir
@@ -720,11 +755,9 @@ def _run_file_in_worktree(
     worktree_path = create_worktree(root_dir)
     try:
         stats = run_file(
-            os.path.join(worktree_path, rel_path), open_pr, max_iterations,
+            os.path.join(worktree_path, rel_path),
+            dataclasses.replace(options, interactive=False),
             standalone_pr=False, sibling_sources=sibling_sources,
-            generate_regression_tests=generate_regression_tests,
-            interactive=False, recipe_instruction=recipe_instruction,
-            punt_check_enabled=punt_check_enabled, characterize=characterize,
         )
         # Report paths relative to the REAL tree, not the throwaway
         # worktree — everything downstream (--report, the combined PR,
@@ -742,10 +775,8 @@ def _run_file_in_worktree(
 
 
 def _run_files_concurrently(
-    files: list[str], open_pr: bool, max_iterations: int, workers: int, file_contents: dict[str, bytes],
-    generate_regression_tests: bool = False, recipe_instruction: str | None = None,
-    root_dir: str | None = None, isolate_workers: bool = False, punt_check_enabled: bool = False,
-    characterize: bool = False,
+    files: list[str], options: RunOptions, file_contents: dict[str, bytes],
+    root_dir: str | None = None,
 ) -> list[dict]:
     """Run run_file() for independent files in parallel. Safe because
     files don't share state — only chunks WITHIN a single file have an
@@ -762,19 +793,18 @@ def _run_files_concurrently(
     it doesn't (there's no existing race this fixes; it's forward-looking
     isolation, opt-in because a worktree checkout per file isn't free)."""
     results: list[dict | None] = [None] * len(files)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    with ThreadPoolExecutor(max_workers=options.workers) as executor:
         future_to_index = {}
         for i, file_path in enumerate(files):
             siblings = [content for fp, content in file_contents.items() if fp != file_path]
-            if isolate_workers:
+            if options.isolate_workers:
                 future = executor.submit(
-                    _run_file_in_worktree, root_dir, file_path, open_pr, max_iterations, siblings,
-                    generate_regression_tests, recipe_instruction, punt_check_enabled, characterize,
+                    _run_file_in_worktree, root_dir, file_path, options, siblings,
                 )
             else:
                 future = executor.submit(
-                    run_file, file_path, open_pr, max_iterations, False, siblings, generate_regression_tests,
-                    False, recipe_instruction, punt_check_enabled, characterize,
+                    run_file, file_path, dataclasses.replace(options, interactive=False),
+                    False, siblings,
                 )
             future_to_index[future] = i
         for future in as_completed(future_to_index):
@@ -788,15 +818,10 @@ def _run_files_concurrently(
     return results
 
 
-def run_repo(
-    root_dir: str, open_pr: bool, max_iterations: int, workers: int = 1, run_target_tests: bool = False,
-    generate_regression_tests: bool = False, interactive: bool = False,
-    recipe_instruction: str | None = None, isolate_workers: bool = False, punt_check_enabled: bool = False,
-    characterize: bool = False, staged_only: bool = False,
-) -> list[dict]:
+def run_repo(root_dir: str, options: RunOptions) -> list[dict]:
     global _last_target_test_result
     _last_target_test_result = None
-    if interactive and workers > 1:
+    if options.interactive and options.workers > 1:
         # A synchronous input() prompt from N concurrent threads at once
         # is a genuinely broken UX (garbled, unpredictable terminal
         # output, no way to tell which file a prompt belongs to) — not
@@ -804,16 +829,16 @@ def run_repo(
         # warning for concurrent mode, actually unusable. Refuse clearly
         # rather than let it silently misbehave.
         raise ValueError("--interactive is not supported with --workers > 1 (concurrent prompts would garble the terminal). Run with --workers 1.")
-    if isolate_workers and workers <= 1:
+    if options.isolate_workers and options.workers <= 1:
         raise ValueError("--isolate-workers only makes sense with --workers > 1.")
-    if isolate_workers:
+    if options.isolate_workers:
         from git_ops.worktree import is_git_repo
         if not is_git_repo(root_dir):
             raise ValueError(
                 f"--isolate-workers requires {root_dir!r} to be a git repository "
                 f"(needs `git worktree` to isolate each worker's checkout)."
             )
-    if staged_only:
+    if options.staged_only:
         from git_ops.staged import get_staged_files
         from git_ops.worktree import is_git_repo
         if not is_git_repo(root_dir):
@@ -828,7 +853,7 @@ def run_repo(
 
     baseline_test_result = None
     test_framework = None
-    if run_target_tests:
+    if options.run_target_tests:
         detected = detect_test_command(root_dir)
         if detected is None:
             print("\n--run-target-tests: no recognized test framework found at repo root — skipping.")
@@ -839,19 +864,16 @@ def run_repo(
             baseline_test_result = run_test_command(root_dir, test_command)
             print(f"Baseline: {baseline_test_result['status']}")
 
-    if workers > 1:
+    if options.workers > 1:
         print(
-            f"Processing with {workers} concurrent workers. Files are "
+            f"Processing with {options.workers} concurrent workers. Files are "
             f"independent (only chunks WITHIN a file have ordering "
             f"dependencies via accumulated state), so this is safe — but "
             f"console output from different files WILL interleave. Use "
             f"--report for clean structured results instead of reading "
             f"the terminal for a concurrent run."
         )
-        all_stats = _run_files_concurrently(
-            files, open_pr, max_iterations, workers, file_contents, generate_regression_tests,
-            recipe_instruction, root_dir, isolate_workers, punt_check_enabled, characterize,
-        )
+        all_stats = _run_files_concurrently(files, options, file_contents, root_dir)
     else:
         all_stats = []
         for i, file_path in enumerate(files, 1):
@@ -871,18 +893,15 @@ def run_repo(
                 # standalone_pr=False: never open a per-file PR here, even
                 # if open_pr is set — repo mode opens ONE combined PR below.
                 stats = run_file(
-                    file_path, open_pr, max_iterations,
+                    file_path, options,
                     standalone_pr=False, sibling_sources=siblings,
-                    generate_regression_tests=generate_regression_tests,
-                    interactive=interactive, recipe_instruction=recipe_instruction,
-                    punt_check_enabled=punt_check_enabled, characterize=characterize,
                 )
             except Exception as e:
                 print(f"ERROR processing {file_path}: {e}")
                 stats = {"file_path": file_path, "error": str(e)}
             all_stats.append(stats)
 
-    if run_target_tests and test_framework is not None:
+    if options.run_target_tests and test_framework is not None:
         overlay_files = {}
         for s in all_stats:
             if not s.get("output_path"):
@@ -933,7 +952,7 @@ def run_repo(
     print(f"Chunks flagged by security scan: {total_security}")
     print(f"Chunks flagged as low-confidence (mutation check): {total_low_confidence}")
 
-    if open_pr:
+    if options.open_pr:
         pr_url = _open_combined_pr(root_dir, all_stats)
         if pr_url:
             print(f"Opened combined PR: {pr_url}")
@@ -964,10 +983,9 @@ def _diff_changed_files(old_mtimes: dict[str, float], new_mtimes: dict[str, floa
 
 
 def watch_run(
-    root_dir: str, open_pr: bool, max_iterations: int,
-    generate_regression_tests: bool = False, recipe_instruction: str | None = None,
+    root_dir: str, options: RunOptions,
     poll_interval_seconds: int = 5, initial_pass: bool = True,
-    punt_check_enabled: bool = False, characterize: bool = False, _max_polls: int | None = None,
+    _max_polls: int | None = None,
 ) -> None:
     """Long-running incremental mode: modernize root_dir once (unless
     initial_pass=False), then poll for file changes and modernize ONLY
@@ -991,10 +1009,7 @@ def watch_run(
 
     if initial_pass:
         print("\n--watch: running an initial full pass before watching for changes...")
-        run_repo(root_dir, open_pr, max_iterations, workers=1,
-                 generate_regression_tests=generate_regression_tests,
-                 recipe_instruction=recipe_instruction, punt_check_enabled=punt_check_enabled,
-                 characterize=characterize)
+        run_repo(root_dir, dataclasses.replace(options, workers=1))
 
     known_mtimes = _scan_mtimes(root_dir)
     polls = 0
@@ -1014,11 +1029,8 @@ def watch_run(
                 siblings = [content for fp, content in file_contents.items() if fp != file_path]
                 try:
                     run_file(
-                        file_path, open_pr, max_iterations,
-                        standalone_pr=open_pr, sibling_sources=siblings,
-                        generate_regression_tests=generate_regression_tests,
-                        recipe_instruction=recipe_instruction, punt_check_enabled=punt_check_enabled,
-                        characterize=characterize,
+                        file_path, options,
+                        standalone_pr=options.open_pr, sibling_sources=siblings,
                     )
                 except Exception as e:
                     print(f"--watch: ERROR processing {file_path}: {e}")
@@ -1245,11 +1257,40 @@ th, td {{ text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #ee
 def main():
     # CLI flag defaults come from .modernizer.toml's [settings] table when
     # present, falling back to the hardcoded values below — an explicit
-    # flag on the command line always overrides both.
-    _settings = _config.get("settings", {})
+    # flag on the command line always overrides both. --profile NAME (if
+    # passed) is resolved FIRST, by peeking at sys.argv before the real
+    # parser exists (argparse has no built-in way to make one flag's
+    # value influence another flag's default), and its bundle of
+    # settings-table keys is layered ON TOP of [settings] — so a profile
+    # overrides the config file's defaults, but an explicit CLI flag
+    # still overrides the profile, since argparse only ever changes a
+    # `default=` when nothing was actually passed on the command line.
+    _settings = dict(_config.get("settings", {}))
+    _profile_parser = argparse.ArgumentParser(add_help=False)
+    _profile_parser.add_argument("--profile", default=_settings.get("profile"))
+    _profile_name = _profile_parser.parse_known_args()[0].profile
+    if _profile_name:
+        _profiles = load_profiles(_config)
+        if _profile_name not in _profiles:
+            _profile_parser.error(
+                f"--profile '{_profile_name}' is not defined — built-in profiles: "
+                f"{', '.join(sorted(config.BUILTIN_PROFILES))}. Add a [profiles.{_profile_name}] "
+                f"table to .modernizer.toml to define a custom one."
+            )
+        _settings.update(_profiles[_profile_name])
 
     parser = argparse.ArgumentParser(description="Automated Code Modernization Engine")
     parser.add_argument("path", help="Path to a legacy source file, OR a directory to modernize recursively")
+    parser.add_argument(
+        "--profile", metavar="NAME", default=_profile_name,
+        help="Apply a named bundle of settings as defaults (still overridable by any "
+             "explicit flag below). Built-in: 'safe' (more iterations, punt-check, "
+             "characterize, and regression tests all on — favors thoroughness over "
+             "speed) and 'fast' (fewer iterations, all the optional verification/test-"
+             "generation extras off — favors turnaround). Define your own by adding a "
+             "[profiles.NAME] table to .modernizer.toml; it can override individual "
+             "fields of a built-in profile of the same name, or introduce a new one.",
+    )
     parser.add_argument("--pr", action="store_true", help="Open a GitHub PR for each modernized file")
     parser.add_argument(
         "--plan", action="store_true",
@@ -1395,6 +1436,20 @@ def main():
             )
         _recipe_instruction = _recipes[args.recipe]
 
+    _options = RunOptions(
+        open_pr=args.pr,
+        max_iterations=args.max_iterations,
+        workers=args.workers,
+        run_target_tests=args.run_target_tests,
+        generate_regression_tests=args.generate_regression_tests,
+        interactive=args.interactive,
+        recipe_instruction=_recipe_instruction,
+        punt_check_enabled=args.punt_check,
+        characterize=args.characterize,
+        isolate_workers=args.isolate_workers,
+        staged_only=args.staged,
+    )
+
     if args.plan and args.watch:
         parser.error("--plan and --watch are not compatible — --plan makes one static estimate, --watch runs forever.")
     if args.staged and args.watch:
@@ -1419,14 +1474,7 @@ def main():
         if not os.path.isdir(args.path):
             parser.error("--watch requires `path` to be a directory (it watches for file changes over time).")
         llm_budget.reset(max_calls=args.max_llm_calls)
-        watch_run(
-            args.path, args.pr, args.max_iterations,
-            generate_regression_tests=args.generate_regression_tests,
-            recipe_instruction=_recipe_instruction,
-            poll_interval_seconds=args.watch_interval,
-            punt_check_enabled=args.punt_check,
-            characterize=args.characterize,
-        )
+        watch_run(args.path, _options, poll_interval_seconds=args.watch_interval)
         return
 
     if args.interactive and args.workers > 1:
@@ -1439,21 +1487,10 @@ def main():
     llm_budget.reset(max_calls=args.max_llm_calls)
 
     if os.path.isdir(args.path):
-        results = run_repo(
-            args.path, args.pr, args.max_iterations, args.workers,
-            args.run_target_tests, args.generate_regression_tests, args.interactive,
-            recipe_instruction=_recipe_instruction, isolate_workers=args.isolate_workers,
-            punt_check_enabled=args.punt_check, characterize=args.characterize,
-            staged_only=args.staged,
-        )
+        results = run_repo(args.path, _options)
         mode = "repo"
     else:
-        results = [run_file(
-            args.path, args.pr, args.max_iterations,
-            generate_regression_tests=args.generate_regression_tests,
-            interactive=args.interactive, recipe_instruction=_recipe_instruction,
-            punt_check_enabled=args.punt_check, characterize=args.characterize,
-        )]
+        results = [run_file(args.path, _options)]
         mode = "file"
 
     _usage = llm_budget.summary()

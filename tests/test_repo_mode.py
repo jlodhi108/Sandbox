@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from main import (
     discover_files, write_report, _open_combined_pr, _unified_diff, _run_files_concurrently,
-    _isolate_probe_baselines,
+    _isolate_probe_baselines, RunOptions,
 )
 from languages.python_lang import PythonHandler
 
@@ -131,14 +131,14 @@ def test_run_repo_refuses_interactive_with_concurrent_workers():
     import main
     import pytest as _pytest
     with _pytest.raises(ValueError, match="workers"):
-        main.run_repo("/fake/root", open_pr=False, max_iterations=5, workers=2, interactive=True)
+        main.run_repo("/fake/root", RunOptions(open_pr=False, max_iterations=5, workers=2, interactive=True))
 
 
 def test_run_repo_refuses_isolate_workers_without_concurrent_workers():
     import main
     import pytest as _pytest
     with _pytest.raises(ValueError, match="--workers > 1"):
-        main.run_repo("/fake/root", open_pr=False, max_iterations=5, workers=1, isolate_workers=True)
+        main.run_repo("/fake/root", RunOptions(open_pr=False, max_iterations=5, workers=1, isolate_workers=True))
 
 
 def test_run_repo_refuses_isolate_workers_on_non_git_directory():
@@ -146,7 +146,7 @@ def test_run_repo_refuses_isolate_workers_on_non_git_directory():
     import pytest as _pytest
     with tempfile.TemporaryDirectory() as root:
         with _pytest.raises(ValueError, match="git repository"):
-            main.run_repo(root, open_pr=False, max_iterations=5, workers=2, isolate_workers=True)
+            main.run_repo(root, RunOptions(open_pr=False, max_iterations=5, workers=2, isolate_workers=True))
 
 
 def test_run_repo_refuses_staged_only_on_non_git_directory():
@@ -154,7 +154,7 @@ def test_run_repo_refuses_staged_only_on_non_git_directory():
     import pytest as _pytest
     with tempfile.TemporaryDirectory() as root:
         with _pytest.raises(ValueError, match="git repository"):
-            main.run_repo(root, open_pr=False, max_iterations=5, staged_only=True)
+            main.run_repo(root, RunOptions(open_pr=False, max_iterations=5, staged_only=True))
 
 
 def test_run_repo_staged_only_discovers_only_staged_files():
@@ -171,7 +171,7 @@ def test_run_repo_staged_only_discovers_only_staged_files():
 
         with patch("main.run_file") as mock_run_file:
             mock_run_file.return_value = {"file_path": "staged.py", "chunks_succeeded": 0}
-            main.run_repo(root, open_pr=False, max_iterations=5, staged_only=True)
+            main.run_repo(root, RunOptions(open_pr=False, max_iterations=5, staged_only=True))
 
         processed_paths = [call.args[0] for call in mock_run_file.call_args_list]
         assert processed_paths == [os.path.join(root, "staged.py")]
@@ -189,9 +189,7 @@ def test_run_file_in_worktree_copies_output_back_to_the_real_tree():
         subprocess.run(["git", "-C", root, "add", "."], check=True)
         subprocess.run(["git", "-C", root, "commit", "-q", "-m", "initial"], check=True)
 
-        def fake_run_file(file_path, open_pr, max_iterations, standalone_pr=True, sibling_sources=None,
-                           generate_regression_tests=False, interactive=False, recipe_instruction=None,
-                           **kwargs):
+        def fake_run_file(file_path, options, standalone_pr=True, sibling_sources=None):
             # Simulate run_file() writing its output INSIDE the worktree
             # it was handed (file_path points there, not at root_dir).
             output_path = file_path.replace("calc.py", "calc.modernized.py")
@@ -201,8 +199,8 @@ def test_run_file_in_worktree_copies_output_back_to_the_real_tree():
 
         with patch("main.run_file", side_effect=fake_run_file):
             stats = _run_file_in_worktree(
-                root, os.path.join(root, "calc.py"), open_pr=False, max_iterations=5,
-                sibling_sources=[], generate_regression_tests=False, recipe_instruction=None,
+                root, os.path.join(root, "calc.py"), RunOptions(open_pr=False, max_iterations=5),
+                sibling_sources=[],
             )
 
         # file_path/output_path must be reported relative to the REAL
@@ -461,12 +459,12 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
     files = ["a.py", "b.py", "c.py"]
     delays = {"a.py": 0.05, "b.py": 0.0, "c.py": 0.0}
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False, interactive=False, recipe_instruction=None, *args, **kwargs):
+    def fake_run_file(file_path, options, standalone_pr=True, sibling_sources=None):
         time.sleep(delays[file_path])
         return {"file_path": file_path, "chunks_succeeded": 1}
 
     with patch("main.run_file", side_effect=fake_run_file):
-        results = _run_files_concurrently(files, open_pr=False, max_iterations=5, workers=3, file_contents={})
+        results = _run_files_concurrently(files, RunOptions(open_pr=False, max_iterations=5, workers=3), {})
 
     assert [r["file_path"] for r in results] == ["a.py", "b.py", "c.py"]
 
@@ -474,13 +472,13 @@ def test_run_files_concurrently_preserves_original_order_despite_out_of_order_co
 def test_run_files_concurrently_isolates_one_file_erroring():
     files = ["good.py", "bad.py"]
 
-    def fake_run_file(file_path, open_pr, max_iterations, standalone_pr, sibling_sources=None, generate_regression_tests=False, interactive=False, recipe_instruction=None, *args, **kwargs):
+    def fake_run_file(file_path, options, standalone_pr=True, sibling_sources=None):
         if file_path == "bad.py":
             raise RuntimeError("boom")
         return {"file_path": file_path, "chunks_succeeded": 1}
 
     with patch("main.run_file", side_effect=fake_run_file):
-        results = _run_files_concurrently(files, open_pr=False, max_iterations=5, workers=2, file_contents={})
+        results = _run_files_concurrently(files, RunOptions(open_pr=False, max_iterations=5, workers=2), {})
 
     assert results[0] == {"file_path": "good.py", "chunks_succeeded": 1}
     assert results[1]["file_path"] == "bad.py"
@@ -559,7 +557,7 @@ def test_run_file_counts_punted_chunks_separately_from_gave_up():
             "risk_flag": False, "security_flag": False, "mutation_confidence_flag": False,
         }
         with patch("main.modernize", return_value=punted_state):
-            stats = main.run_file(file_path, open_pr=False, max_iterations=5, punt_check_enabled=True)
+            stats = main.run_file(file_path, RunOptions(open_pr=False, max_iterations=5, punt_check_enabled=True))
 
     assert stats["chunks_punted"] == 1
     assert stats["chunks_gave_up"] == 0
@@ -583,7 +581,7 @@ def test_run_file_characterize_writes_test_pinning_original_code():
         }
         with patch("main.modernize", return_value=fake_state), \
              patch("main.verify", return_value={"status": "success", "stdout": "Bob\n", "stderr": "", "exit_code": 0}):
-            stats = main.run_file(file_path, open_pr=False, max_iterations=5, characterize=True)
+            stats = main.run_file(file_path, RunOptions(open_pr=False, max_iterations=5, characterize=True))
 
         assert stats["characterization_test_path"] is not None
         with open(stats["characterization_test_path"]) as f:
@@ -613,7 +611,7 @@ def test_run_file_characterize_captures_gave_up_chunks_too():
         }
         with patch("main.modernize", return_value=fake_state), \
              patch("main.verify", return_value={"status": "success", "stdout": "1\n", "stderr": "", "exit_code": 0}):
-            stats = main.run_file(file_path, open_pr=False, max_iterations=5, characterize=True)
+            stats = main.run_file(file_path, RunOptions(open_pr=False, max_iterations=5, characterize=True))
 
         assert stats["characterization_test_path"] is not None
         with open(stats["characterization_test_path"]) as f:
@@ -639,7 +637,7 @@ def test_run_file_characterize_off_by_default():
         }
         with patch("main.modernize", return_value=fake_state), \
              patch("main.verify", return_value={"status": "success", "stdout": "Bob\n", "stderr": "", "exit_code": 0}):
-            stats = main.run_file(file_path, open_pr=False, max_iterations=5)
+            stats = main.run_file(file_path, RunOptions(open_pr=False, max_iterations=5))
 
     assert stats["characterization_test_path"] is None
 
@@ -668,7 +666,7 @@ def test_run_file_computes_correct_start_line_for_security_flagged_chunk():
         }
         with patch("main.modernize", return_value=fake_state), \
              patch("main.verify", return_value={"status": "success", "stdout": "", "stderr": "", "exit_code": 0}):
-            stats = main.run_file(file_path, open_pr=False, max_iterations=5)
+            stats = main.run_file(file_path, RunOptions(open_pr=False, max_iterations=5))
 
     assert len(stats["security_flagged"]) == 1
     assert stats["security_flagged"][0]["start_line"] == 5  # 1-indexed line "def greet" starts on

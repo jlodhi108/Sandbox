@@ -21,6 +21,48 @@ def load_config(path: str | None = None) -> dict:
         return tomllib.load(f)
 
 
+# Built-in bundles of [settings]-table keys, applied by --profile NAME
+# when NAME isn't defined as a [profiles.NAME] table in .modernizer.toml.
+# Exist so a first-time user gets a sensible named starting point without
+# writing any TOML at all — "safe" trades speed for maximum verification/
+# audit trail, "fast" trades verification depth for turnaround. A
+# [profiles.NAME] table with the same name in the user's own config
+# always takes precedence over these (see load_profiles).
+BUILTIN_PROFILES = {
+    "safe": {
+        "max_iterations": 8,
+        "punt_check": True,
+        "characterize": True,
+        "generate_regression_tests": True,
+    },
+    "fast": {
+        "max_iterations": 2,
+        "punt_check": False,
+        "characterize": False,
+        "generate_regression_tests": False,
+    },
+}
+
+
+def load_profiles(config: dict) -> dict[str, dict]:
+    """Named settings bundles — {name: {settings_key: value}} — merged
+    onto .modernizer.toml's [settings] table when --profile NAME is
+    passed (see main.py's --profile handling). Each profile table can
+    set any key [settings] itself supports (max_iterations, punt_check,
+    characterize, workers, etc.).
+
+    User-defined [profiles.NAME] tables in .modernizer.toml are layered
+    ON TOP of BUILTIN_PROFILES (same name overrides, e.g. a user's own
+    [profiles.safe] table wins over the built-in "safe" bundle field by
+    field, not wholesale) — so someone can tweak just one field of a
+    built-in profile without redefining the rest of it."""
+    result = {name: dict(values) for name, values in BUILTIN_PROFILES.items()}
+    for name, table in config.get("profiles", {}).items():
+        if isinstance(table, dict):
+            result.setdefault(name, {}).update(table)
+    return result
+
+
 def load_recipes(config: dict) -> dict[str, str]:
     """Named modernization recipes from .modernizer.toml's [recipes.<name>]
     tables — {name: instruction}. Each recipe's `instruction` string is
@@ -42,15 +84,16 @@ def load_recipes(config: dict) -> dict[str, str]:
 
 def apply_config_to_environment(config: dict) -> None:
     """Push config values that other modules read from os.environ at
-    IMPORT time (ESCALATION_MODEL, ESCALATION_THRESHOLD, REVIEWER_MODEL,
-    GITHUB_REPO, EMBEDDING_MODEL) into the environment — using setdefault,
-    so an already-set env var (from the shell, or from .env via
-    load_dotenv()) always wins over the config file. Precedence end to
-    end: CLI flag > env var > .env file > config file > hardcoded default.
+    IMPORT time (BASE_MODEL, ESCALATION_MODEL, ESCALATION_THRESHOLD,
+    REVIEWER_MODEL, GITHUB_REPO, EMBEDDING_MODEL) into the environment —
+    using setdefault, so an already-set env var (from the shell, or from
+    .env via load_dotenv()) always wins over the config file. Precedence
+    end to end: CLI flag > env var > .env file > config file > hardcoded
+    default.
 
     Must be called BEFORE `from agents.graph import modernize` for
-    ESCALATION_MODEL/ESCALATION_THRESHOLD/REVIEWER_MODEL/SANDBOX_RUNTIME/
-    EMBEDDING_MODEL specifically — those are read from os.environ once at
+    BASE_MODEL/ESCALATION_MODEL/ESCALATION_THRESHOLD/REVIEWER_MODEL/
+    SANDBOX_RUNTIME/EMBEDDING_MODEL specifically — those are read from os.environ once at
     that import's module-load time (agents.graph imports embeddings,
     which reads EMBEDDING_MODEL exactly like agents.nodes reads
     ESCALATION_MODEL), so anything set only here would silently never
@@ -60,6 +103,10 @@ def apply_config_to_environment(config: dict) -> None:
     .invoke() call, not baked in when ChatOllama is constructed) but are
     applied here too, for one consistent place to reason about
     configuration."""
+    model = config.get("model", {})
+    if "base_model" in model:
+        os.environ.setdefault("BASE_MODEL", str(model["base_model"]))
+
     escalation = config.get("escalation", {})
     if "model" in escalation:
         os.environ.setdefault("ESCALATION_MODEL", str(escalation["model"]))

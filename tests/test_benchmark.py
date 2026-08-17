@@ -29,7 +29,7 @@ def test_run_benchmark_aggregates_by_language():
             },
         }
 
-        def fake_run_file(file_path, open_pr, max_iterations, **kwargs):
+        def fake_run_file(file_path, options, *args, **kwargs):
             return fake_stats[os.path.basename(file_path)]
 
         with patch("benchmark.run_file", side_effect=fake_run_file):
@@ -74,7 +74,7 @@ def test_run_benchmark_skips_files_that_error_without_crashing():
     with tempfile.TemporaryDirectory() as root:
         _touch(os.path.join(root, "a.py"))
 
-        def fake_run_file(file_path, open_pr, max_iterations, **kwargs):
+        def fake_run_file(file_path, options, *args, **kwargs):
             raise RuntimeError("boom")
 
         with patch("benchmark.run_file", side_effect=fake_run_file):

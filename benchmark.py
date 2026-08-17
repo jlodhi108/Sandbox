@@ -37,7 +37,7 @@ load_dotenv()
 _config = load_config()
 apply_config_to_environment(_config)
 
-from main import run_file, discover_files
+from main import run_file, discover_files, RunOptions
 from agents.nodes import llm_budget
 
 DEFAULT_SAMPLES_DIR = "legacy_samples"
@@ -52,11 +52,12 @@ def run_benchmark(samples_dir: str, max_iterations: int = 5, max_llm_calls: int 
     llm_budget.reset(max_calls=max_llm_calls)
     files = discover_files(samples_dir)
 
+    options = RunOptions(open_pr=False, max_iterations=max_iterations)
     start = time.time()
     file_results = []
     for file_path in files:
         try:
-            stats = run_file(file_path, open_pr=False, max_iterations=max_iterations)
+            stats = run_file(file_path, options)
         except Exception as e:
             stats = {"file_path": file_path, "error": str(e)}
         file_results.append(stats)

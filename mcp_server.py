@@ -108,10 +108,28 @@ def _update_track_record(results: list[dict]) -> None:
         main._history = updated
 
 
+def _resolve_recipe_instruction(recipe: str | None) -> str | None:
+    """Look up `recipe` in .modernizer.toml's [recipes.*] tables — same
+    lookup main.py's CLI does for --recipe. Raises ValueError (not
+    parser.error, since there's no argparse here) for an unknown name,
+    listing what IS defined so the calling agent can self-correct."""
+    if recipe is None:
+        return None
+    recipes = main.load_recipes(main._config)
+    if recipe not in recipes:
+        raise ValueError(
+            f"recipe '{recipe}' is not defined — add a [recipes.{recipe}] "
+            f"table with an `instruction` string to .modernizer.toml. "
+            f"Available: {', '.join(sorted(recipes)) or '(none defined)'}"
+        )
+    return recipes[recipe]
+
+
 @mcp.tool
 def modernize_file(
     file_path: str, max_iterations: int = 5, open_pr: bool = False, max_llm_calls: int | None = None,
-    generate_regression_tests: bool = False,
+    generate_regression_tests: bool = False, recipe: str | None = None, punt_check: bool = False,
+    characterize: bool = False,
 ) -> dict:
     """Modernize one legacy source file (C++/Python/JS/TS/Java/PHP,
     detected from its extension). file_path should be an ABSOLUTE path —
@@ -148,14 +166,34 @@ def modernize_file(
     Supported for python/javascript/typescript/php (the languages that
     generate probes at all); a no-op for cpp/java.
 
+    recipe scopes this run to a named [recipes.<name>] instruction table
+    from .modernizer.toml (raises if the name isn't defined there).
+
+    punt_check=True asks the model to self-assess confidence before
+    attempting each chunk, skipping ones it doubts before any rewrite
+    attempt or sandbox verification — costs one extra LLM call per chunk
+    to potentially save a much larger one.
+
+    characterize=True generates a characterization test (pins ORIGINAL,
+    pre-modernization behavior) for every chunk attempted, including ones
+    that gave up — a permanent safety net distinct from
+    generate_regression_tests, which only covers successes.
+
     Returns a stats dict: chunks_total/succeeded/already_modern/gave_up/
-    budget_exceeded, output_path, regression_test_path, final_check_passed,
-    pr_url, a chunk_details list (per-chunk status, diff, risk/security/
+    budget_exceeded, output_path, regression_test_path,
+    characterization_test_path, final_check_passed, pr_url, a
+    chunk_details list (per-chunk status, diff, risk/security/
     mutation-confidence flags), and llm_usage (calls/tokens actually
     spent on this run)."""
     with _protect_stdout():
         main.llm_budget.reset(max_calls=max_llm_calls or _configured_max_llm_calls())
-        stats = main.run_file(file_path, open_pr, max_iterations, generate_regression_tests=generate_regression_tests)
+        options = main.RunOptions(
+            open_pr=open_pr, max_iterations=max_iterations,
+            generate_regression_tests=generate_regression_tests,
+            recipe_instruction=_resolve_recipe_instruction(recipe),
+            punt_check_enabled=punt_check, characterize=characterize,
+        )
+        stats = main.run_file(file_path, options)
         _update_track_record([stats])
     stats["llm_usage"] = main.llm_budget.summary()
     return stats
@@ -165,7 +203,8 @@ def modernize_file(
 def modernize_repo(
     root_dir: str, max_iterations: int = 5, workers: int = 1, open_pr: bool = False,
     max_llm_calls: int | None = None, run_target_tests: bool = False,
-    generate_regression_tests: bool = False,
+    generate_regression_tests: bool = False, recipe: str | None = None, punt_check: bool = False,
+    characterize: bool = False, isolate_workers: bool = False, staged_only: bool = False,
 ) -> dict:
     """Modernize every supported source file under root_dir (recursive,
     .gitignore-aware, skips node_modules/.git/build output dirs etc.).
@@ -215,12 +254,34 @@ def modernize_repo(
     verification into lasting test coverage that needs neither this
     project nor an LLM to re-check later. Always a NEW sibling file,
     never overwrites anything. Supported for python/javascript/
-    typescript/php; a no-op for cpp/java."""
+    typescript/php; a no-op for cpp/java.
+
+    recipe scopes this run to a named [recipes.<name>] instruction table
+    from .modernizer.toml (raises if the name isn't defined there).
+
+    punt_check=True asks the model to self-assess confidence before
+    attempting each chunk, skipping ones it doubts before any rewrite
+    attempt. characterize=True generates a characterization test for
+    every chunk attempted (including gave-up ones), not just successes.
+
+    isolate_workers=True routes each concurrent worker through its own
+    `git worktree` checkout instead of the shared root_dir directly —
+    only meaningful with workers > 1, and requires root_dir be a git
+    repository.
+
+    staged_only=True processes only files currently staged for commit
+    (`git add`) instead of every modernizable file under root_dir —
+    root_dir must be a git repository."""
     with _protect_stdout():
         main.llm_budget.reset(max_calls=max_llm_calls or _configured_max_llm_calls())
-        results = main.run_repo(
-            root_dir, open_pr, max_iterations, workers, run_target_tests, generate_regression_tests,
+        options = main.RunOptions(
+            open_pr=open_pr, max_iterations=max_iterations, workers=workers,
+            run_target_tests=run_target_tests, generate_regression_tests=generate_regression_tests,
+            recipe_instruction=_resolve_recipe_instruction(recipe),
+            punt_check_enabled=punt_check, characterize=characterize,
+            isolate_workers=isolate_workers, staged_only=staged_only,
         )
+        results = main.run_repo(root_dir, options)
         _update_track_record(results)
     return {
         "files": results,
@@ -234,6 +295,33 @@ def modernize_repo(
         },
         "target_test_result": main._last_target_test_result,
         "llm_usage": main.llm_budget.summary(),
+    }
+
+
+@mcp.tool
+def plan(path: str, max_iterations: int = 5) -> dict:
+    """Report scope and estimated LLM-call cost for modernizing `path`
+    (a single file or a whole directory), WITHOUT making any LLM or
+    Docker call — pure tree-sitter parsing plus the already-modern
+    heuristic check, both fully local and instant. Mirrors the CLI's
+    --plan flag; use this before a real modernize_file/modernize_repo
+    call to see what it would cost. path should be an ABSOLUTE path,
+    same reasoning as modernize_file/modernize_repo.
+
+    Returns {"files": [...per-file plan_file() dicts: file_path,
+    language, chunks_total, chunks_already_modern, chunks_to_modernize,
+    estimated_llm_calls_min, estimated_llm_calls_max...],
+    "summary": {...totals across every file...}}."""
+    plans = main.plan_run(path, max_iterations)
+    return {
+        "files": plans,
+        "summary": {
+            "files": len(plans),
+            "chunks_total": sum(p["chunks_total"] for p in plans),
+            "chunks_to_modernize": sum(p["chunks_to_modernize"] for p in plans),
+            "estimated_llm_calls_min": sum(p["estimated_llm_calls_min"] for p in plans),
+            "estimated_llm_calls_max": sum(p["estimated_llm_calls_max"] for p in plans),
+        },
     }
 
 

@@ -111,6 +111,12 @@ workers = 1
 # improvement for every workload.
 # punt_check = true
 
+[model]
+# The workhorse model every chunk is first attempted with. Must already
+# be pulled locally (`ollama pull <name>`). Defaults to qwen2.5-coder:14b
+# if unset.
+# base_model = "qwen2.5-coder:14b"
+
 [escalation]
 # model = "qwen2.5-coder:32b"
 # threshold = 3
@@ -193,6 +199,27 @@ workers = 1
 # shown as a worked "before/after" example on each chunk's first
 # attempt. No separate setting — it's the same embedding_model gate,
 # since showing an unranked example would do more harm than good.
+
+# Named settings bundles, selected via --profile NAME (or the [settings]
+# `profile` key above to make one the default for every run). Two
+# built-in profiles always exist even without any [profiles.*] table
+# here: "safe" (max_iterations=8, punt_check/characterize/
+# generate_regression_tests all true — favors thoroughness) and "fast"
+# (max_iterations=2, those three off — favors turnaround). A
+# [profiles.NAME] table here with the SAME name as a built-in overrides
+# just the fields you set, leaving the rest of that built-in's defaults
+# in place; a new NAME defines a wholly custom profile. Any individual
+# CLI flag still overrides whatever the active profile sets.
+#
+# [profiles.safe]
+# max_iterations = 12  # override just this one field of the built-in "safe"
+#
+# [profiles.thorough]
+# max_iterations = 10
+# punt_check = true
+# characterize = true
+# generate_regression_tests = true
+# run_target_tests = true
 
 [observability]
 # Per-chunk LLM tracing via LangSmith (smith.langchain.com) — token

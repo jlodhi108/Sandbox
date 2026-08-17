@@ -1,7 +1,7 @@
 import os
 import tempfile
 
-from config import load_config, apply_config_to_environment, load_recipes
+from config import load_config, apply_config_to_environment, load_recipes, load_profiles, BUILTIN_PROFILES
 
 
 def test_load_config_returns_empty_dict_when_file_missing():
@@ -48,6 +48,57 @@ def test_load_recipes_skips_malformed_entries():
         }
     }
     assert load_recipes(config) == {"good": "Do the thing."}
+
+
+def test_load_profiles_returns_builtins_when_no_config():
+    profiles = load_profiles({})
+    assert profiles["safe"] == BUILTIN_PROFILES["safe"]
+    assert profiles["fast"] == BUILTIN_PROFILES["fast"]
+
+
+def test_load_profiles_user_table_overrides_individual_builtin_fields():
+    config = {"profiles": {"safe": {"max_iterations": 3}}}
+    profiles = load_profiles(config)
+    # only max_iterations overridden — every other builtin "safe" field survives
+    assert profiles["safe"]["max_iterations"] == 3
+    assert profiles["safe"]["punt_check"] == BUILTIN_PROFILES["safe"]["punt_check"]
+
+
+def test_load_profiles_adds_a_new_custom_profile():
+    config = {"profiles": {"thorough": {"max_iterations": 10, "characterize": True}}}
+    profiles = load_profiles(config)
+    assert profiles["thorough"] == {"max_iterations": 10, "characterize": True}
+    assert "safe" in profiles and "fast" in profiles  # builtins still present
+
+
+def test_load_profiles_ignores_malformed_entries():
+    config = {"profiles": {"bad": "not a table"}}
+    profiles = load_profiles(config)
+    assert "bad" not in profiles
+
+
+def test_apply_config_to_environment_sets_base_model():
+    config = {"model": {"base_model": "qwen2.5-coder:7b"}}
+    env_backup = dict(os.environ)
+    try:
+        os.environ.pop("BASE_MODEL", None)
+        apply_config_to_environment(config)
+        assert os.environ["BASE_MODEL"] == "qwen2.5-coder:7b"
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
+
+
+def test_apply_config_to_environment_never_overrides_existing_base_model():
+    config = {"model": {"base_model": "config-file-model"}}
+    env_backup = dict(os.environ)
+    try:
+        os.environ["BASE_MODEL"] = "shell-set-model"
+        apply_config_to_environment(config)
+        assert os.environ["BASE_MODEL"] == "shell-set-model"
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
 
 
 def test_apply_config_to_environment_sets_escalation_vars():

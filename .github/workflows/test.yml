@@ -34,6 +34,66 @@ jobs:
       - run: docker build -t sandbox-multi -f sandbox/sandbox-multi.Dockerfile sandbox/
       - run: python sandbox/verifier.py
 
+  e2e-smoke-test:
+    # Tier 4: the ONE job in this file that makes a real LLM call — every
+    # other job here either mocks the LLM entirely (unit-tests) or never
+    # calls it (sandbox-smoke-test). Unit tests catch logic bugs but
+    # can't catch a broken PROMPT (a template that no longer produces
+    # output the parser expects, a system message that stopped fitting
+    # in a smaller model's context) — that class of bug only shows up by
+    # actually calling a model. Runs the full real pipeline (real Ollama,
+    # real Docker sandbox) against ONE trivial single-chunk fixture with
+    # a small/fast model (BASE_MODEL — see agents/nodes.py; this is
+    # exactly the override --characterize/RunOptions Task #24 added,
+    # exercised here for the first time in CI) and a tight LLM-call cap,
+    # so it stays fast and cheap enough to run on every push/PR — unlike
+    # benchmark.py's full multi-language, multi-fixture scorecard run
+    # (deliberately workflow_dispatch/schedule-only, see benchmark.yml),
+    # this is a pass/fail tripwire, not a quality measurement.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: docker build -t sandbox-multi -f sandbox/sandbox-multi.Dockerfile sandbox/
+
+      - name: Install Ollama and pull a small, fast model
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:11434/ >/dev/null 2>&1 && break
+            sleep 1
+          done
+          ollama pull qwen2.5-coder:1.5b
+
+      - name: Run real pipeline against one trivial fixture
+        env:
+          BASE_MODEL: qwen2.5-coder:1.5b
+        run: |
+          python main.py tests/fixtures/smoke/legacy.py \
+            --max-iterations 3 --max-llm-calls 20 --report smoke-report.json
+
+      - name: Verify the chunk was actually modernized and verified
+        run: |
+          python -c "
+          import json
+          with open('smoke-report.json') as f:
+              report = json.load(f)
+          stats = report['results'][0]
+          assert stats['chunks_succeeded'] >= 1, f'no chunk succeeded: {stats}'
+          assert stats['final_check_passed'] is True, f'final check failed: {stats}'
+          print('e2e smoke test OK:', stats['chunks_succeeded'], 'chunk(s) modernized and verified')
+          "
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-report
+          path: smoke-report.json
+
   action-yaml-lint:
     # Tier 3: action.yml gets committed by hand and never actually
     # exercised by unit-tests/sandbox-smoke-test above — this catches a

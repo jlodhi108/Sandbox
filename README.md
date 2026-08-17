@@ -119,6 +119,7 @@ Key flags (see `python main.py --help` for the full list):
 
 | Flag | Description |
 |---|---|
+| `--profile NAME` | Apply a named bundle of settings as defaults (still overridable by any other flag). Built-in: `safe` (thoroughness — more iterations, punt-check/characterize/regression-tests on) and `fast` (turnaround — fewer iterations, extras off). Define your own via `[profiles.NAME]` in `.modernizer.toml` |
 | `--plan` | Report scope and estimated LLM-call cost with zero LLM/Docker calls, then exit |
 | `--pr` | Open a GitHub PR for each modernized file |
 | `--max-iterations N` | Max fix-attempt loops per chunk (default 5) |
@@ -177,9 +178,11 @@ Every CLI flag has a matching input; see `action.yml` for the full list.
 
 ## Running as an MCP server
 
-`mcp_server.py` exposes the same pipeline as MCP tools, so an MCP client
-(Claude Code, Cursor, Claude Desktop, etc.) can drive a modernization run
-directly:
+`mcp_server.py` exposes the same pipeline as MCP tools — `modernize_file`,
+`modernize_repo`, `plan`, `check_track_record`, `list_track_record` — with
+the same flags as the CLI (`recipe`, `punt_check`, `characterize`,
+`isolate_workers`, `staged_only`, etc.), so an MCP client (Claude Code,
+Cursor, Claude Desktop, etc.) can drive a modernization run directly:
 
 ```bash
 python mcp_server.py
@@ -191,6 +194,15 @@ python mcp_server.py
 source .venv/bin/activate
 pytest tests/ -v
 ```
+
+CI (`.github/workflows/test.yml`) runs this unit suite plus two smaller
+real-pipeline checks on every push/PR: a Docker sandbox smoke test (builds
+the multi-language image, compiles+runs a snippet in each language — no
+LLM call), and an end-to-end smoke test that runs the real pipeline (real
+Ollama, real Docker) against one trivial single-chunk fixture with a
+small/fast model, to catch prompt-template breakage unit tests can't see
+(they mock the LLM). Both stay fast/cheap enough for every push, unlike
+`benchmark.py`'s full scorecard run below.
 
 ## Self-benchmark
 
